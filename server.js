@@ -43,8 +43,9 @@ if (process.env.NODE_ENV !== "test") {
 const allowedOrigins = [
   process.env.CLIENT_URL,
   process.env.FRONTEND_URL,
-  "http://localhost:5173",
-  "https://recycle-trade.vercel.app",
+  // "http://localhost:5173",
+  "https://fundssmartphones.de/",
+  // "https://recycle-trade.vercel.app",
 ];
 
 app.use(
