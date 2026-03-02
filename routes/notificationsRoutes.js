@@ -1,0 +1,1285 @@
+const express = require("express");
+const nodemailer = require("nodemailer");
+const axios = require("axios");
+
+const router = express.Router();
+
+// ==================== UNIVERSAL EMAIL CONFIGURATION ====================
+class UniversalEmailService {
+  constructor() {
+    this.transporter = null;
+    this.isConfigured = false;
+    this.init();
+  }
+
+  init() {
+    console.log('\n📧 ========== INITIALIZING EMAIL SERVICE ==========');
+    console.log('📧 Checking available email configurations...');
+    
+    // Check what's available
+    const hasResend = !!process.env.RESEND_API_KEY;
+    const hasSMTP = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+    const hasGmail = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
+    
+    console.log(`📧 Resend API Key: ${hasResend ? '✅ Found' : '❌ Not set'}`);
+    console.log(`📧 SMTP Config: ${hasSMTP ? '✅ Found' : '❌ Not set'}`);
+    console.log(`📧 Gmail Config: ${hasGmail ? '✅ Found' : '❌ Not set'}`);
+    
+    // IMPORTANT: On cloud servers (Railway, Vercel, etc.), SMTP ports 587/465 are often blocked
+    // Resend uses HTTPS API and works everywhere - prioritize it for production
+    const transporters = [];
+    
+    // 1. Try Resend first (works on all servers, API-based, not SMTP)
+    const resendTransporter = this.createResendTransporter();
+    if (resendTransporter) {
+      transporters.push(resendTransporter);
+      console.log('📧 Resend transporter added (recommended for cloud servers)');
+    }
+    
+    // 2. Try SMTP (generic, might work on some servers)
+    const smtpTransporter = this.createSMTPTransporter();
+    if (smtpTransporter) {
+      transporters.push(smtpTransporter);
+      console.log('📧 SMTP transporter added');
+    }
+    
+    // 3. Try Gmail last (often blocked on cloud servers due to SMTP port restrictions)
+    // NOTE: Gmail SMTP (ports 587/465) is often blocked on cloud platforms
+    // If you're on Railway/Vercel/etc., Gmail SMTP will likely timeout
+    // Solution: Use Resend.com (free tier available) or enable "Less secure app access" + use OAuth2
+    if (hasGmail) {
+      console.log('📧 Attempting Gmail transporter (may fail on cloud servers due to SMTP port blocking)...');
+      const gmailTransporter = this.createGmailTransporter();
+      if (gmailTransporter) {
+        transporters.push(gmailTransporter);
+        console.log('📧 Gmail transporter added (will be tested during verification)');
+      } else {
+        console.warn('⚠️ Gmail transporter creation failed - this is normal on cloud servers that block SMTP');
+      }
+    }
+    
+    // 4. Development fallback
+    const etherealTransporter = this.createEtherealTransporter();
+    if (etherealTransporter) {
+      transporters.push(etherealTransporter);
+      console.log('📧 Ethereal transporter added (development only)');
+    }
+
+    if (transporters.length > 0) {
+      this.transporter = transporters[0];
+      this.isConfigured = true;
+      console.log(`✅ Email service initialized with: ${transporters[0].name}`);
+      console.log(`📧 Total available transporters: ${transporters.length}`);
+      
+      // Verify connection in background
+      this.verifyConnection();
+    } else {
+      console.error('❌ No email transport configured - emails will be logged only');
+      console.error('❌ Please set EMAIL_USER and EMAIL_PASS for Gmail, or configure another email service');
+    }
+    
+    console.log('📧 ================================================\n');
+  }
+
+  // 1. RESEND.COM (Uses REST API via HTTPS - works on ALL servers, no SMTP ports needed)
+  createResendTransporter() {
+    if (process.env.RESEND_API_KEY) {
+      try {
+        console.log('📧 Resend: Initializing Resend REST API (HTTPS-based, works on all servers)...');
+        
+        // Create a special transporter object that uses Resend REST API
+        const resendTransporter = {
+          name: 'Resend (REST API)',
+          apiKey: process.env.RESEND_API_KEY,
+          // Flag to indicate this uses REST API, not SMTP
+          isResendAPI: true,
+          // Skip verification (REST API doesn't need SMTP verification)
+          verify: async () => {
+            console.log('✅ Resend: REST API ready (no verification needed)');
+            return true;
+          }
+        };
+        
+        console.log('✅ Resend: REST API transporter initialized successfully');
+        return resendTransporter;
+      } catch (error) {
+        console.error('❌ Resend: Failed to initialize:', error.message);
+        return null;
+      }
+    }
+    return null;
+  }
+
+  // 2. GENERIC SMTP (Works with any SMTP provider)
+  createSMTPTransporter() {
+    if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: process.env.SMTP_PORT || 587,
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        },
+        connectionTimeout: 10000,  // Reduced to 10 seconds
+        greetingTimeout: 5000,     // Reduced to 5 seconds
+        socketTimeout: 10000,       // Reduced to 10 seconds
+        tls: {
+          rejectUnauthorized: false
+        }
+      });
+      transporter.name = 'SMTP';
+      return transporter;
+    }
+    return null;
+  }
+
+  // 3. GMAIL (Common but less reliable in cloud)
+  createGmailTransporter() {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      console.log('📧 Gmail: EMAIL_USER or EMAIL_PASS not set, skipping Gmail transporter');
+      return null;
+    }
+
+    console.log('📧 Gmail: Attempting to create Gmail transporter...');
+    console.log('📧 Gmail: Using email:', process.env.EMAIL_USER);
+    console.log('📧 Gmail: Password provided:', process.env.EMAIL_PASS ? 'Yes (hidden)' : 'No');
+
+    const portsToTry = [
+      { port: 587, secure: false, name: 'STARTTLS' },
+      { port: 465, secure: true, name: 'SSL/TLS' }
+    ];
+
+    for (const config of portsToTry) {
+      try {
+        console.log(`📧 Gmail: Trying port ${config.port} (${config.name})...`);
+        
+        const transporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com',
+          port: config.port,
+          secure: config.secure,
+          auth: {
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASS
+          },
+          connectionTimeout: 15000, // 15 seconds
+          greetingTimeout: 10000,   // 10 seconds
+          socketTimeout: 15000,     // 15 seconds
+          tls: {
+            rejectUnauthorized: false,
+            ciphers: 'SSLv3'
+          },
+          debug: true, // Enable debug logging
+          logger: true  // Enable logger
+        });
+        
+        transporter.name = `Gmail (port ${config.port})`;
+        console.log(`✅ Gmail: Transporter created for port ${config.port}`);
+        return transporter;
+      } catch (error) {
+        console.error(`❌ Gmail: Failed to create transporter on port ${config.port}:`, error.message);
+        continue;
+      }
+    }
+    
+    console.error('❌ Gmail: All port attempts failed');
+    return null;
+  }
+
+  // 4. ETHEREAL (Development/Testing fallback)
+  createEtherealTransporter() {
+    if (process.env.NODE_ENV === 'development') {
+      const transporter = nodemailer.createTransport({
+        host: 'smtp.ethereal.email',
+        port: 587,
+        secure: false,
+        auth: {
+          user: 'test@ethereal.email',
+          pass: 'test'
+        }
+      });
+      transporter.name = 'Ethereal (Test)';
+      return transporter;
+    }
+    return null;
+  }
+
+  async verifyConnection() {
+    if (!this.transporter) {
+      console.log('📧 Verify: No transporter available to verify');
+      return;
+    }
+    
+    // Skip verification for Resend REST API (it's not SMTP, doesn't need verification)
+    if (this.transporter.isResendAPI) {
+      console.log(`✅ Resend: REST API ready (no SMTP verification needed)`);
+      return;
+    }
+    
+    console.log(`📧 Verify: Starting connection verification for ${this.transporter.name}...`);
+    
+    // Don't block - verify in background with timeout
+    setTimeout(async () => {
+      try {
+        console.log(`📧 Verify: Attempting to verify ${this.transporter.name} connection...`);
+        
+        // Use Promise.race to add timeout to verification
+        const verifyPromise = this.transporter.verify();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Verification timeout after 10 seconds')), 10000)
+        );
+        
+        await Promise.race([verifyPromise, timeoutPromise]);
+        console.log(`✅ Verify: Email connection verified successfully for ${this.transporter.name}`);
+      } catch (error) {
+        const errorMsg = error.message || 'Unknown error';
+        console.error(`❌ Verify: Email connection verification FAILED for ${this.transporter.name}`);
+        console.error(`❌ Verify: Error details:`, {
+          message: errorMsg,
+          code: error.code,
+          command: error.command,
+          response: error.response,
+          responseCode: error.responseCode
+        });
+        
+        // Log specific error types
+        if (errorMsg.includes('timeout') || errorMsg.includes('ETIMEDOUT')) {
+          console.error(`❌ Verify: Connection timeout - Gmail server not responding`);
+          console.error(`❌ Verify: This usually means:`);
+          console.error(`   - Your cloud server (Railway/Vercel/etc.) is BLOCKING SMTP ports 587/465`);
+          console.error(`   - Gmail SMTP will NOT work on most cloud platforms`);
+          console.error(`   - Network connectivity issues`);
+          console.error(`\n💡 SOLUTION: Use Resend.com (API-based, works everywhere)`);
+          console.error(`   - Sign up at https://resend.com (free tier: 3,000 emails/month)`);
+          console.error(`   - Get API key and set: RESEND_API_KEY=re_your_key`);
+          console.error(`   - See EMAIL_SETUP_GUIDE.md for details`);
+        } else if (errorMsg.includes('EAUTH') || errorMsg.includes('authentication')) {
+          console.error(`❌ Verify: Authentication failed - check EMAIL_USER and EMAIL_PASS`);
+          console.error(`❌ Verify: Make sure you're using an App Password, not your regular password`);
+        } else if (errorMsg.includes('ECONNREFUSED')) {
+          console.error(`❌ Verify: Connection refused - Gmail server not reachable`);
+        } else {
+          console.error(`❌ Verify: Unknown error: ${errorMsg}`);
+        }
+      }
+    }, 2000); // Wait 2 seconds before verifying to not block startup
+  }
+
+  // NEW: Send email via Resend REST API (HTTPS, works on all servers)
+  async sendViaResendAPI(options) {
+    try {
+      console.log('📧 Resend API: Sending email via HTTPS REST API...');
+      
+      // Parse from address - handle different formats
+      let from;
+      
+      if (typeof options.from === 'object') {
+        // Object format: { name: 'F&S Smartphones', address: 'email@example.com' }
+        const fromAddress = options.from.address;
+        const fromName = options.from.name;
+        // Format for Resend: "Name <email@example.com>" or just "email@example.com"
+        from = fromName ? `${fromName} <${fromAddress}>` : fromAddress;
+      } else if (typeof options.from === 'string') {
+        // String format: could be "email@example.com" or "Name <email@example.com>"
+        // Check if it's already in the correct format
+        if (options.from.includes('<') && options.from.includes('>')) {
+          // Already formatted: "Name <email@example.com>" - use as is
+          from = options.from.trim();
+        } else {
+          // Just email: "email@example.com" - use as is (Resend accepts this)
+          from = options.from.trim();
+        }
+      } else {
+        // Fallback - use environment variable or default
+        const defaultFrom = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+        // Check if EMAIL_FROM is already formatted
+        if (defaultFrom.includes('<') && defaultFrom.includes('>')) {
+          from = defaultFrom;
+        } else {
+          from = `F&S Smartphones <${defaultFrom}>`;
+        }
+      }
+      
+      console.log('📧 Resend API: From address:', from);
+      
+      // Prepare Resend API request
+      const resendPayload = {
+        from: from,
+        to: [options.to], // Resend expects array
+        subject: options.subject,
+        html: options.html || options.text,
+        ...(options.text && { text: options.text })
+      };
+      
+      console.log('📧 Resend API: Calling Resend API via HTTPS...');
+      
+      // Call Resend REST API
+      const response = await axios.post(
+        'https://api.resend.com/emails',
+        resendPayload,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.transporter.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000 // 15 second timeout
+        }
+      );
+      
+      console.log('✅ Resend API: Email sent successfully via HTTPS');
+      console.log('✅ Resend API: Response:', response.data);
+      
+      // Format response to match nodemailer format
+      return {
+        messageId: response.data.id || `resend-${Date.now()}`,
+        accepted: [options.to],
+        rejected: [],
+        response: response.data
+      };
+    } catch (error) {
+      console.error('❌ Resend API: Failed to send email via REST API');
+      console.error('❌ Resend API: Error:', error.response?.data || error.message);
+      console.error('❌ Resend API: Status:', error.response?.status);
+      console.error('❌ Resend API: Full error:', error);
+      
+      throw new Error(`Resend API error: ${error.response?.data?.message || error.message}`);
+    }
+  }
+
+  async sendEmail(mailOptions) {
+    // Handle EMAIL_FROM - it might be formatted string or just email
+    let defaultFrom;
+    const emailFrom = process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER || 'onboarding@resend.dev';
+    
+    // Check if EMAIL_FROM is already formatted as "Name <email@example.com>"
+    if (emailFrom.includes('<') && emailFrom.includes('>')) {
+      // Already formatted string - use as is
+      defaultFrom = emailFrom;
+    } else {
+      // Just email address - create object for formatting
+      defaultFrom = {
+        name: 'F&S Smartphones',
+        address: emailFrom
+      };
+    }
+
+    const options = {
+      from: mailOptions.from || defaultFrom,
+      to: mailOptions.to,
+      subject: mailOptions.subject,
+      html: mailOptions.html,
+      text: mailOptions.text
+    };
+
+    // If no transporter, log the email (never fail)
+    if (!this.isConfigured || !this.transporter) {
+      console.log('📧 EMAIL LOGGED (No transporter):', {
+        to: options.to,
+        subject: options.subject,
+        html: options.html.substring(0, 100) + '...'
+      });
+      return { messageId: 'logged-only', accepted: [options.to] };
+    }
+
+    try {
+      console.log(`📧 Send: Attempting to send email via ${this.transporter.name}...`);
+      console.log(`📧 Send: To: ${options.to}`);
+      console.log(`📧 Send: Subject: ${options.subject}`);
+      console.log(`📧 Send: From: ${typeof options.from === 'object' ? options.from.address : options.from}`);
+      
+      // Check if this is Resend REST API (not SMTP)
+      if (this.transporter.isResendAPI) {
+        return await this.sendViaResendAPI(options);
+      }
+      
+      // For SMTP transporters, use nodemailer
+      // Add timeout wrapper to prevent hanging
+      const sendPromise = this.transporter.sendMail(options);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Email send timeout after 20 seconds')), 20000)
+      );
+      
+      const result = await Promise.race([sendPromise, timeoutPromise]);
+      console.log(`✅ Send: Email sent successfully via ${this.transporter.name}`);
+      console.log(`✅ Send: Message ID: ${result.messageId}`);
+      console.log(`✅ Send: Accepted recipients: ${result.accepted?.join(', ') || 'N/A'}`);
+      if (result.rejected && result.rejected.length > 0) {
+        console.warn(`⚠️ Send: Rejected recipients: ${result.rejected.join(', ')}`);
+      }
+      return result;
+    } catch (error) {
+      // Comprehensive error logging
+      const errorMsg = error.message || 'Unknown error';
+      const errorCode = error.code || 'NO_CODE';
+      const isTimeout = errorMsg.includes('timeout') || errorMsg.includes('ETIMEDOUT') || errorCode === 'ETIMEDOUT';
+      const isAuthError = errorMsg.includes('EAUTH') || errorMsg.includes('authentication') || errorCode === 'EAUTH';
+      const isConnectionError = errorMsg.includes('ECONNREFUSED') || errorMsg.includes('ENOTFOUND') || errorCode === 'ECONNREFUSED';
+      
+      console.error(`\n❌ ========== EMAIL SEND FAILED ==========`);
+      console.error(`❌ Transporter: ${this.transporter.name}`);
+      console.error(`❌ To: ${options.to}`);
+      console.error(`❌ Subject: ${options.subject}`);
+      console.error(`❌ Error Message: ${errorMsg}`);
+      console.error(`❌ Error Code: ${errorCode}`);
+      
+      if (isTimeout) {
+        console.error(`❌ Error Type: CONNECTION TIMEOUT`);
+        console.error(`❌ Details: Email server did not respond within 20 seconds`);
+        console.error(`❌ Possible causes:`);
+        console.error(`   - Gmail SMTP servers are blocking your connection`);
+        console.error(`   - Firewall or network blocking port 587/465`);
+        console.error(`   - Server network connectivity issues`);
+        console.error(`   - Gmail rate limiting or blocking`);
+      } else if (isAuthError) {
+        console.error(`❌ Error Type: AUTHENTICATION FAILED`);
+        console.error(`❌ Details: Invalid email credentials`);
+        console.error(`❌ Possible causes:`);
+        console.error(`   - Wrong EMAIL_USER or EMAIL_PASS`);
+        console.error(`   - Using regular password instead of App Password`);
+        console.error(`   - 2FA not enabled or App Password not generated`);
+        console.error(`   - Account security settings blocking access`);
+      } else if (isConnectionError) {
+        console.error(`❌ Error Type: CONNECTION REFUSED`);
+        console.error(`❌ Details: Cannot reach Gmail SMTP server`);
+        console.error(`❌ Possible causes:`);
+        console.error(`   - Network connectivity issues`);
+        console.error(`   - DNS resolution problems`);
+        console.error(`   - Firewall blocking outbound connections`);
+      } else {
+        console.error(`❌ Error Type: UNKNOWN ERROR`);
+        console.error(`❌ Full Error:`, error);
+      }
+      
+      console.error(`❌ ========================================\n`);
+      
+      // Log email content that failed
+      console.log('📧 FAILED EMAIL DETAILS:', {
+        to: options.to,
+        subject: options.subject,
+        from: typeof options.from === 'object' ? options.from.address : options.from,
+        error: errorMsg,
+        errorCode: errorCode
+      });
+      
+      // Re-throw the error so caller knows it failed
+      throw error;
+    }
+  }
+}
+
+// Initialize email service
+const emailService = new UniversalEmailService();
+
+// ==================== HELPER FUNCTIONS ====================
+const getOrderShortId = (order) => {
+  try {
+    const orderId = order._id?.toString ? order._id.toString() : String(order._id);
+    return orderId.slice(-8);
+  } catch (error) {
+    return 'N/A';
+  }
+};
+
+// ==================== EMAIL ROUTES ====================
+
+// Test endpoint to check email configuration
+router.get("/test-config", async (req, res) => {
+  const config = {
+    availableServices: {
+      resend: !!process.env.RESEND_API_KEY,
+      smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER),
+      gmail: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS),
+      ethereal: process.env.NODE_ENV === 'development'
+    },
+    currentService: emailService.transporter?.name || 'none',
+    isConfigured: emailService.isConfigured,
+    fromEmail: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
+    emailUser: process.env.EMAIL_USER ? `${process.env.EMAIL_USER.substring(0, 3)}***` : 'Not set',
+    hasEmailPass: !!process.env.EMAIL_PASS
+  };
+
+  res.json(config);
+});
+
+// NEW: Debug endpoint to test email service (works with any configured service)
+router.get("/debug-email", async (req, res) => {
+  try {
+    console.log('\n🔍 ========== EMAIL DEBUG TEST ==========');
+    
+    if (!emailService.isConfigured || !emailService.transporter) {
+      return res.json({ 
+        success: false, 
+        error: 'No email service configured',
+        config: {
+          isConfigured: emailService.isConfigured,
+          transporter: emailService.transporter?.name || 'none',
+          availableServices: {
+            resend: !!process.env.RESEND_API_KEY,
+            smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER),
+            gmail: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS)
+          }
+        },
+        solution: 'Set RESEND_API_KEY for cloud servers, or EMAIL_USER/EMAIL_PASS for local development'
+      });
+    }
+
+    console.log('🔍 Testing email service:', emailService.transporter.name);
+    console.log('🔍 Service type:', emailService.transporter.isResendAPI ? 'Resend REST API (HTTPS)' : 'SMTP');
+    
+    const testEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER || 'test@example.com';
+    
+    console.log('🔍 Step 1: Testing email send...');
+    console.log('🔍 Test email will be sent to:', testEmail);
+    
+    try {
+      const result = await emailService.sendEmail({
+        to: testEmail,
+        subject: 'Email Service Test - F&S Smartphones',
+        html: `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>✅ Email Service Test Successful!</h2>
+            <p>If you received this email, your email configuration is working correctly.</p>
+            <p><strong>Service:</strong> ${emailService.transporter.name}</p>
+            <p><strong>Test Time:</strong> ${new Date().toLocaleString()}</p>
+            <p><strong>Server:</strong> ${process.env.NODE_ENV || 'development'}</p>
+          </div>
+        `
+      });
+      
+      console.log('✅ Step 1: Email send successful');
+      console.log('✅ Message ID:', result.messageId);
+      console.log('🔍 ============================================\n');
+      
+      return res.json({ 
+        success: true, 
+        message: 'Email service working correctly!',
+        messageId: result.messageId,
+        sentTo: testEmail,
+        transporter: emailService.transporter.name,
+        serviceType: emailService.transporter.isResendAPI ? 'REST API (HTTPS)' : 'SMTP'
+      });
+    } catch (sendError) {
+      console.error('❌ Step 1: Email send failed:', sendError.message);
+      console.error('🔍 ============================================\n');
+      
+      return res.json({ 
+        success: false, 
+        step: 'email_send',
+        error: sendError.message,
+        errorCode: sendError.code,
+        transporter: emailService.transporter.name,
+        details: {
+          message: 'Email sending failed',
+          possibleCauses: emailService.transporter.isResendAPI ? [
+            'Invalid RESEND_API_KEY',
+            'Resend API rate limiting',
+            'Invalid email address format',
+            'Network connectivity issues'
+          ] : [
+            'SMTP connection timeout (common on cloud servers)',
+            'Wrong credentials',
+            'Firewall blocking SMTP ports',
+            'Network connectivity issues'
+          ]
+        }
+      });
+    }
+  } catch (error) {
+    console.error('❌ Debug test failed:', error.message);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      errorCode: error.code
+    });
+  }
+});
+
+// Send test email
+router.post("/test-email", async (req, res) => {
+  try {
+    const { to = process.env.ADMIN_EMAIL } = req.body;
+
+    if (!to) {
+      return res.status(400).json({ 
+        message: "No recipient email provided" 
+      });
+    }
+
+    const result = await emailService.sendEmail({
+      to,
+      subject: 'Test Email from F&S Smartphones',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #10B981;">✅ Test Email Successful!</h2>
+          <p>This is a test email from your F&S Smartphones application.</p>
+          <div style="background: #f3f4f6; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h3>Configuration Details:</h3>
+            <p><strong>Service:</strong> ${emailService.transporter?.name || 'Logged Only'}</p>
+            <p><strong>Time:</strong> ${new Date().toString()}</p>
+            <p><strong>Environment:</strong> ${process.env.NODE_ENV}</p>
+          </div>
+          <p>If you received this, your email service is working correctly! 🎉</p>
+        </div>
+      `
+    });
+
+    res.json({
+      message: "Test email processed successfully",
+      service: emailService.transporter?.name || 'logged',
+      messageId: result.messageId,
+      accepted: result.accepted
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Test email failed",
+      error: error.message
+    });
+  }
+});
+
+// NEW: Reusable function to send order confirmation email (can be called directly)
+const sendOrderConfirmationEmail = async (order, customer) => {
+  if (!customer.email) {
+    console.log('⚠️ No customer email provided, skipping order confirmation');
+    return { skipped: true, message: "No customer email provided" };
+  }
+
+  try {
+    console.log('📧 Sending order confirmation email...', {
+      customerEmail: customer.email,
+      orderId: order._id
+    });
+
+    const shortOrderId = getOrderShortId(order);
+    
+    // Format order date
+    const orderDate = order.createdAt 
+      ? new Date(order.createdAt).toLocaleDateString('en-US', { 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit'
+        })
+      : new Date().toLocaleDateString('en-US', { 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+
+    // Build items HTML
+    let itemsHtml = '';
+    if (order.items && Array.isArray(order.items)) {
+      itemsHtml = order.items.map((item, index) => {
+        const productName = item.productId?.name || item.name || 'Product';
+        const quantity = item.quantity || 1;
+        const price = item.price || 0;
+        const subtotal = price * quantity;
+        
+        // Get variant specs if available
+        let variantInfo = '';
+        if (item.variantId && item.productId?.variants) {
+          const variant = item.productId.variants.find(v => 
+            v._id?.toString() === item.variantId?.toString()
+          );
+          if (variant && variant.specs) {
+            const specs = variant.specs instanceof Map 
+              ? Object.fromEntries(variant.specs) 
+              : variant.specs;
+            const specsEntries = Object.entries(specs);
+            if (specsEntries.length > 0) {
+              variantInfo = `<div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px;">${specsEntries.map(([key, value]) => 
+                `<span style="background: #f3f4f6; padding: 4px 8px; border-radius: 4px; font-size: 11px; color: #374151; border: 1px solid #e5e7eb;"><strong style="text-transform: capitalize;">${key}:</strong> ${value}</span>`
+              ).join('')}</div>`;
+            }
+          }
+        }
+        
+        return `
+          <tr style="border-bottom: 1px solid #e5e7eb;">
+            <td style="padding: 12px; text-align: left;">
+              <strong style="display: block; margin-bottom: 4px;">${productName}</strong>
+              ${variantInfo}
+            </td>
+            <td style="padding: 12px; text-align: center;">${quantity}</td>
+            <td style="padding: 12px; text-align: right;">€${price.toFixed(2)}</td>
+            <td style="padding: 12px; text-align: right; font-weight: bold;">€${subtotal.toFixed(2)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Payment status
+    const paymentStatus = order.paymentStatus === 'Paid' 
+      ? '<span style="color: #059669; font-weight: bold;">Paid</span>' 
+      : '<span style="color: #d97706; font-weight: bold;">Pending</span>';
+
+    // Delivery/Shipping info
+    let deliveryInfo = '';
+    if (order.deliveryMethod === 'pickup' && order.outletId) {
+      deliveryInfo = `
+        <div style="background: #fef3c7; padding: 15px; border-radius: 8px; margin: 15px 0;">
+          <h4 style="color: #d97706; margin-top: 0;">Pickup Information</h4>
+          <p><strong>Outlet:</strong> ${order.outletId.name || 'Selected Outlet'}</p>
+          <p><strong>Address:</strong> ${order.outletId.address || 'N/A'}</p>
+          <p><strong>Phone:</strong> ${order.outletId.phone || 'N/A'}</p>
+          ${order.outletId.email ? `<p><strong>Email:</strong> ${order.outletId.email}</p>` : ''}
+        </div>
+      `;
+    } else if (order.guestInfo?.address) {
+      deliveryInfo = `
+        <div style="background: #f0f9ff; padding: 15px; border-radius: 8px; margin: 15px 0;">
+          <h4 style="color: #0284c7; margin-top: 0;">Delivery Address</h4>
+          <p>${order.guestInfo.address}</p>
+          <p>${order.guestInfo.postalCode || ''} ${order.guestInfo.country || ''}</p>
+        </div>
+      `;
+    }
+
+    const result = await emailService.sendEmail({
+      to: customer.email,
+      subject: `Order Confirmation - #${shortOrderId}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
+          <!-- Header -->
+          <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+            <h1 style="color: #ffffff; margin: 0; font-size: 28px;">Thank You for Your Order!</h1>
+            <p style="color: #d1fae5; margin: 10px 0 0 0; font-size: 16px;">Order #${shortOrderId}</p>
+          </div>
+
+          <!-- Content -->
+          <div style="padding: 30px; background: #ffffff;">
+            <p style="font-size: 16px; color: #374151; margin: 0 0 20px 0;">Dear ${customer.name},</p>
+            <p style="font-size: 16px; color: #374151; margin: 0 0 30px 0;">Your order has been received and is being processed. We'll send you another email when your order ships.</p>
+            
+            <!-- Order Details -->
+            <div style="background: #f9fafb; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #10b981;">
+              <h3 style="margin-top: 0; color: #111827; font-size: 18px;">Order Details</h3>
+              <table style="width: 100%; margin: 10px 0;">
+                <tr>
+                  <td style="padding: 6px 0; color: #6b7280;"><strong>Order ID:</strong></td>
+                  <td style="padding: 6px 0; color: #111827; text-align: right;"><strong>#${shortOrderId}</strong></td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; color: #6b7280;"><strong>Order Date:</strong></td>
+                  <td style="padding: 6px 0; color: #111827; text-align: right;">${orderDate}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; color: #6b7280;"><strong>Payment Method:</strong></td>
+                  <td style="padding: 6px 0; color: #111827; text-align: right;">${order.paymentMethod || 'N/A'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; color: #6b7280;"><strong>Payment Status:</strong></td>
+                  <td style="padding: 6px 0; text-align: right;">${paymentStatus}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 6px 0; color: #6b7280;"><strong>Delivery Method:</strong></td>
+                  <td style="padding: 6px 0; color: #111827; text-align: right;">${order.deliveryMethod === 'delivery' ? 'Home Delivery' : 'Outlet Pickup'}</td>
+                </tr>
+              </table>
+            </div>
+
+            <!-- Order Items -->
+            <div style="margin: 30px 0;">
+              <h3 style="color: #111827; font-size: 18px; margin-bottom: 15px;">Order Items</h3>
+              <table style="width: 100%; border-collapse: collapse; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
+                <thead>
+                  <tr style="background: #f9fafb;">
+                    <th style="padding: 12px; text-align: left; font-weight: 600; color: #374151; border-bottom: 2px solid #e5e7eb;">Product</th>
+                    <th style="padding: 12px; text-align: center; font-weight: 600; color: #374151; border-bottom: 2px solid #e5e7eb;">Qty</th>
+                    <th style="padding: 12px; text-align: right; font-weight: 600; color: #374151; border-bottom: 2px solid #e5e7eb;">Price</th>
+                    <th style="padding: 12px; text-align: right; font-weight: 600; color: #374151; border-bottom: 2px solid #e5e7eb;">Subtotal</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${itemsHtml}
+                </tbody>
+                <tfoot>
+                  <tr style="background: #f9fafb; border-top: 2px solid #e5e7eb;">
+                    <td colspan="3" style="padding: 15px; text-align: right; font-weight: 600; color: #374151;">Total:</td>
+                    <td style="padding: 15px; text-align: right; font-weight: bold; font-size: 18px; color: #111827;">€${order.total?.toFixed(2) || '0.00'}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+            ${deliveryInfo}
+
+            <!-- Footer -->
+            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+              <p style="color: #6b7280; font-size: 14px; margin: 10px 0;">We'll notify you when your order status changes.</p>
+              <p style="color: #6b7280; font-size: 14px; margin: 10px 0;">If you have any questions, please contact our support team.</p>
+              <p style="margin-top: 20px; color: #111827; font-weight: 600;">Best regards,<br><strong>F&S Smartphones Team</strong></p>
+            </div>
+          </div>
+
+          <!-- Footer Bar -->
+          <div style="background: #f9fafb; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e5e7eb;">
+            <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&S Smartphones. All rights reserved.</p>
+          </div>
+        </div>
+      `
+    });
+    
+    return {
+      success: true,
+      message: "Order confirmation processed successfully",
+      messageId: result.messageId,
+      service: emailService.transporter?.name || 'logged'
+    };
+  } catch (error) {
+    console.error("❌ Error sending order confirmation:", error);
+    throw error; // Re-throw to let caller handle
+  }
+};
+
+// Route handler that uses the function above
+router.post("/send-order-confirmation", async (req, res) => {
+  try {
+    const { order, customer } = req.body;
+    const result = await sendOrderConfirmationEmail(order, customer);
+    
+    if (result.skipped) {
+      return res.json(result);
+    }
+    
+    res.json(result);
+  } catch (error) {
+    console.error("❌ Error in order confirmation route:", error);
+    res.status(500).json({ 
+      message: "Failed to process order confirmation", 
+      error: error.message 
+    });
+  }
+});
+
+// NEW: Reusable function to send status update email (can be called directly)
+const sendStatusUpdateEmail = async (to, order, customerName, status, trackingNumber = null) => {
+  if (!to) {
+    console.log('⚠️ No recipient email provided, skipping status update email');
+    return { skipped: true, message: "No recipient email provided" };
+  }
+
+  try {
+
+    const shortOrderId = getOrderShortId(order);
+    const subject = `Order Status Update - #${shortOrderId}`;
+    
+    // Status color and icon
+    let statusColor = '#059669';
+    let statusIcon = '✅';
+    let statusMessage = '';
+    
+    if (status === 'Shipped' || status === 'Processing') {
+      statusColor = '#0284c7';
+      statusIcon = '🚚';
+      statusMessage = 'Your order is on the way!';
+    } else if (status === 'Ready for Pickup') {
+      statusColor = '#d97706';
+      statusIcon = '📦';
+      statusMessage = 'Your order is ready for pickup!';
+    } else if (status === 'Delivered' || status === 'Completed') {
+      statusColor = '#059669';
+      statusIcon = '🎉';
+      statusMessage = 'Your order has been delivered!';
+    } else {
+      statusMessage = 'Your order status has been updated.';
+    }
+
+    // Build items summary with variant details
+    let itemsSummary = '';
+    if (order.items && Array.isArray(order.items)) {
+      itemsSummary = order.items.map((item, index) => {
+        const productName = item.productId?.name || item.name || 'Product';
+        const quantity = item.quantity || 1;
+        const price = item.price || 0;
+        const subtotal = price * quantity;
+        
+        // Get variant specs if available
+        let variantInfo = '';
+        if (item.variantId && item.productId?.variants) {
+          const variant = item.productId.variants.find(v => 
+            v._id?.toString() === item.variantId?.toString()
+          );
+          if (variant && variant.specs) {
+            const specs = variant.specs instanceof Map 
+              ? Object.fromEntries(variant.specs) 
+              : variant.specs;
+            const specsEntries = Object.entries(specs);
+            if (specsEntries.length > 0) {
+              variantInfo = `<div style="margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px;">${specsEntries.map(([key, value]) => 
+                `<span style="background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 10px; color: #374151; border: 1px solid #e5e7eb;"><strong style="text-transform: capitalize;">${key}:</strong> ${value}</span>`
+              ).join('')}</div>`;
+            }
+          }
+        }
+        
+        return `
+          <li style="margin: 8px 0; padding: 8px; background: #f9fafb; border-radius: 4px; border-left: 3px solid ${statusColor};">
+            <div style="font-weight: 600; color: #111827;">${productName} × ${quantity}</div>
+            ${variantInfo}
+            <div style="margin-top: 4px; font-size: 12px; color: #6b7280;">
+              Price: €${price.toFixed(2)} | Subtotal: <strong>€${subtotal.toFixed(2)}</strong>
+            </div>
+          </li>
+        `;
+      }).join('');
+    }
+
+    let htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
+        <!-- Header -->
+        <div style="background: linear-gradient(135deg, ${statusColor} 0%, ${statusColor}dd 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+          <div style="font-size: 48px; margin-bottom: 10px;">${statusIcon}</div>
+          <h1 style="color: #ffffff; margin: 0; font-size: 28px;">${statusMessage}</h1>
+          <p style="color: #ffffffdd; margin: 10px 0 0 0; font-size: 16px;">Order #${shortOrderId}</p>
+        </div>
+
+        <!-- Content -->
+        <div style="padding: 30px; background: #ffffff;">
+          <p style="font-size: 16px; color: #374151; margin: 0 0 20px 0;">Dear ${customerName},</p>
+          <p style="font-size: 16px; color: #374151; margin: 0 0 30px 0;">We wanted to let you know that your order status has been updated.</p>
+          
+          <!-- Status Card -->
+          <div style="background: #f0f9ff; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid ${statusColor};">
+            <h3 style="margin-top: 0; color: #111827; font-size: 18px;">Order Status</h3>
+            <table style="width: 100%; margin: 10px 0;">
+              <tr>
+                <td style="padding: 6px 0; color: #6b7280;"><strong>Order ID:</strong></td>
+                <td style="padding: 6px 0; color: #111827; text-align: right;"><strong>#${shortOrderId}</strong></td>
+              </tr>
+              <tr>
+                <td style="padding: 6px 0; color: #6b7280;"><strong>Status:</strong></td>
+                <td style="padding: 6px 0; text-align: right;"><span style="color: ${statusColor}; font-weight: bold; font-size: 16px;">${status}</span></td>
+              </tr>
+    `;
+
+    if (trackingNumber) {
+      htmlContent += `
+              <tr>
+                <td style="padding: 6px 0; color: #6b7280;"><strong>Tracking Number:</strong></td>
+                <td style="padding: 6px 0; color: #111827; text-align: right;"><strong>${trackingNumber}</strong></td>
+              </tr>
+              <tr>
+                <td colspan="2" style="padding: 10px 0; text-align: center;">
+                  <a href="https://www.dhl.com/en/express/tracking.html?AWB=${trackingNumber}" 
+                     target="_blank"
+                     style="display: inline-block; background: ${statusColor}; color: #ffffff; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-weight: 600; margin-top: 10px;">
+                    Track Your Package with DHL
+                  </a>
+                </td>
+              </tr>
+      `;
+    }
+
+    htmlContent += `
+            </table>
+          </div>
+
+          <!-- Order Items Summary -->
+          ${itemsSummary ? `
+          <div style="background: #f9fafb; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3 style="margin-top: 0; color: #111827; font-size: 18px;">Order Items</h3>
+            <ul style="margin: 10px 0; padding-left: 20px; color: #374151;">
+              ${itemsSummary}
+            </ul>
+            <p style="margin: 15px 0 0 0; font-weight: 600; color: #111827;">Total: €${order.total?.toFixed(2) || '0.00'}</p>
+          </div>
+          ` : ''}
+    `;
+
+    // Add specific information based on status
+    if (status === 'Shipped' && trackingNumber) {
+      htmlContent += `
+          <div style="background: #fef3c7; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #d97706;">
+            <h3 style="color: #d97706; margin-top: 0;">📦 Shipping Information</h3>
+            <p style="color: #374151; margin: 10px 0;">Your order has been shipped via DHL Express and is on its way to you!</p>
+            <p style="color: #374151; margin: 10px 0;">You can track your package using the tracking number above or click the "Track Your Package with DHL" button.</p>
+            <p style="color: #374151; margin: 10px 0;"><strong>Expected Delivery:</strong> Please allow 3-5 business days for delivery via DHL Express.</p>
+          </div>
+      `;
+    } else if (status === 'Ready for Pickup') {
+      htmlContent += `
+          <div style="background: #fef3c7; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #d97706;">
+            <h3 style="color: #d97706; margin-top: 0;">📍 Pickup Information</h3>
+            <p style="color: #374151; margin: 10px 0;">Your order is ready for pickup at the following location:</p>
+            <div style="background: #ffffff; padding: 15px; border-radius: 6px; margin: 15px 0;">
+              <p style="margin: 8px 0; font-weight: 600; color: #111827; font-size: 16px;">${order.outletId?.name || 'Selected Outlet'}</p>
+              <p style="margin: 8px 0; color: #374151;">${order.outletId?.address || 'Outlet address'}</p>
+              ${order.outletId?.phone ? `<p style="margin: 8px 0; color: #374151;">📞 Phone: ${order.outletId.phone}</p>` : ''}
+              ${order.outletId?.email ? `<p style="margin: 8px 0; color: #374151;">✉️ Email: ${order.outletId.email}</p>` : ''}
+            </div>
+            <p style="color: #374151; margin: 15px 0 0 0;"><strong>Please bring a valid ID when picking up your order.</strong></p>
+          </div>
+      `;
+    } else if (status === 'Delivered' || status === 'Completed') {
+      htmlContent += `
+          <div style="background: #d1fae5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669;">
+            <h3 style="color: #059669; margin-top: 0;">🎉 Delivery Complete!</h3>
+            <p style="color: #374151; margin: 10px 0;">Your order has been successfully delivered. We hope you enjoy your purchase!</p>
+            <p style="color: #374151; margin: 15px 0 0 0;">If you have any questions or concerns, please don't hesitate to contact our support team.</p>
+          </div>
+      `;
+    }
+
+    htmlContent += `
+          <!-- Footer -->
+          <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+            <p style="color: #6b7280; font-size: 14px; margin: 10px 0;">If you have any questions about your order, please contact our support team.</p>
+            <p style="margin-top: 20px; color: #111827; font-weight: 600;">Best regards,<br><strong>F&S Smartphones Team</strong></p>
+          </div>
+        </div>
+
+        <!-- Footer Bar -->
+        <div style="background: #f9fafb; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e5e7eb;">
+          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&S Smartphones. All rights reserved.</p>
+        </div>
+      </div>
+    `;
+
+    const result = await emailService.sendEmail({
+      to,
+      subject,
+      html: htmlContent
+    });
+
+    console.log("✅ Status update email sent to:", to);
+    return {
+      success: true,
+      message: "Status update email processed successfully",
+      messageId: result.messageId,
+      service: emailService.transporter?.name || 'logged'
+    };
+  } catch (error) {
+    console.error("❌ Error sending status email:", error);
+    throw error; // Re-throw to let caller handle
+  }
+};
+
+// Route handler that uses the function above
+router.post("/send-status-email", async (req, res) => {
+  try {
+    const { to, order, customerName, status, trackingNumber } = req.body;
+    const result = await sendStatusUpdateEmail(to, order, customerName, status, trackingNumber);
+    
+    if (result.skipped) {
+      return res.json(result);
+    }
+    
+    res.json(result);
+  } catch (error) {
+    console.error("❌ Error in status email route:", error);
+    res.status(500).json({ 
+      message: "Failed to process status update email",
+      error: error.message 
+    });
+  }
+});
+
+// 3. GENERIC EMAIL SENDER
+router.post("/send-email", async (req, res) => {
+  try {
+    const { to, subject, html } = req.body;
+
+    if (!to || !subject || !html) {
+      return res.status(400).json({
+        message: "Missing required fields: to, subject, html"
+      });
+    }
+
+    // Check if email service is configured
+    if (!emailService.isConfigured || !emailService.transporter) {
+      console.error("❌ Email service not configured");
+      return res.status(500).json({ 
+        message: "Email service is not configured",
+        error: "No email transporter available",
+        suggestion: "Set RESEND_API_KEY or EMAIL_USER/EMAIL_PASS in environment variables",
+        config: {
+          hasResend: !!process.env.RESEND_API_KEY,
+          hasSMTP: !!(process.env.SMTP_HOST && process.env.SMTP_USER),
+          hasGmail: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS)
+        }
+      });
+    }
+
+    console.log(`📧 Sending email via ${emailService.transporter.name} to: ${to}`);
+    const result = await emailService.sendEmail({
+      to,
+      subject,
+      html
+    });
+
+    if (result && result.messageId) {
+      console.log("✅ Email sent successfully to:", to);
+      console.log("✅ Message ID:", result.messageId);
+      res.json({ 
+        message: "Email processed successfully",
+        messageId: result.messageId,
+        service: emailService.transporter?.name || 'logged'
+      });
+    } else {
+      console.warn("⚠️ Email may not have been sent (no messageId returned)");
+      res.json({ 
+        message: "Email request processed (may be logged only)",
+        messageId: result?.messageId || 'logged-only',
+        service: emailService.transporter?.name || 'logged',
+        warning: "Email service may not be fully configured"
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error sending email:", error);
+    console.error("❌ Error details:", {
+      message: error.message,
+      code: error.code,
+      response: error.response?.data
+    });
+    res.status(500).json({ 
+      message: "Failed to process email",
+      error: error.message,
+      errorCode: error.code,
+      details: error.response?.data || error.message,
+      suggestion: "Check email service configuration and server logs"
+    });
+  }
+});
+
+// NEW: Send order cancellation email
+const sendOrderCancellationEmail = async (to, order, customerName, reason) => {
+  if (!to) {
+    console.log('⚠️ No recipient email provided, skipping cancellation email');
+    return { skipped: true, message: "No recipient email provided" };
+  }
+
+  try {
+    const emailService = new UniversalEmailService();
+    const shortOrderId = order._id.toString().slice(-8);
+    const subject = `Order Cancelled - #${shortOrderId}`;
+    
+    // Reason messages
+    let reasonMessage = '';
+    if (reason === 'abandoned') {
+      reasonMessage = 'Your order was automatically cancelled because payment was not completed within 5 minutes.';
+    } else if (reason === 'user_cancelled' || reason === 'stripe_cancelled') {
+      reasonMessage = 'Your order was cancelled as requested.';
+    } else if (reason === 'payment_failed') {
+      reasonMessage = 'Your order was cancelled due to unsuccessful payment.';
+    } else {
+      reasonMessage = 'Your order has been cancelled.';
+    }
+
+    // Build items summary
+    let itemsSummary = '';
+    if (order.items && Array.isArray(order.items)) {
+      order.items.forEach((item, index) => {
+        const productName = item.productId?.name || 'Product';
+        const quantity = item.quantity || 1;
+        const price = item.price || 0;
+        itemsSummary += `
+          <tr>
+            <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${index + 1}</td>
+            <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">${productName}</td>
+            <td style="padding: 12px; border-bottom: 1px solid #e5e7eb; text-align: center;">${quantity}</td>
+            <td style="padding: 12px; border-bottom: 1px solid #e5e7eb; text-align: right;">€${price.toFixed(2)}</td>
+            <td style="padding: 12px; border-bottom: 1px solid #e5e7eb; text-align: right;">€${(quantity * price).toFixed(2)}</td>
+          </tr>
+        `;
+      });
+    }
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
+        <!-- Header -->
+        <div style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+          <h1 style="color: #ffffff; margin: 0; font-size: 24px;">Order Cancelled</h1>
+        </div>
+
+        <!-- Content -->
+        <div style="padding: 30px; border: 1px solid #e5e7eb; border-top: none;">
+          <p style="color: #374151; font-size: 16px; margin: 0 0 20px 0;">Hello ${customerName},</p>
+          
+          <p style="color: #374151; font-size: 16px; margin: 0 0 20px 0;">
+            We regret to inform you that your order <strong>#${shortOrderId}</strong> has been cancelled.
+          </p>
+
+          <div style="background: #fef2f2; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #dc2626;">
+            <h3 style="color: #dc2626; margin-top: 0;">Cancellation Details</h3>
+            <p style="color: #374151; margin: 10px 0;">${reasonMessage}</p>
+            <p style="color: #374151; margin: 15px 0 0 0;">
+              <strong>Order Total:</strong> €${order.total?.toFixed(2) || '0.00'}<br>
+              <strong>Cancelled On:</strong> ${new Date().toLocaleString()}
+            </p>
+          </div>
+
+          <h3 style="color: #111827; margin-top: 30px; margin-bottom: 15px;">Order Items:</h3>
+          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+            <thead>
+              <tr style="background: #f9fafb;">
+                <th style="padding: 12px; text-align: left; border-bottom: 2px solid #e5e7eb;">#</th>
+                <th style="padding: 12px; text-align: left; border-bottom: 2px solid #e5e7eb;">Product</th>
+                <th style="padding: 12px; text-align: center; border-bottom: 2px solid #e5e7eb;">Qty</th>
+                <th style="padding: 12px; text-align: right; border-bottom: 2px solid #e5e7eb;">Price</th>
+                <th style="padding: 12px; text-align: right; border-bottom: 2px solid #e5e7eb;">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itemsSummary}
+            </tbody>
+            <tfoot>
+              <tr>
+                <td colspan="4" style="padding: 12px; text-align: right; font-weight: bold; border-top: 2px solid #e5e7eb;">Total:</td>
+                <td style="padding: 12px; text-align: right; font-weight: bold; border-top: 2px solid #e5e7eb;">€${order.total?.toFixed(2) || '0.00'}</td>
+              </tr>
+            </tfoot>
+          </table>
+
+          <div style="background: #f0f9ff; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #0284c7;">
+            <h3 style="color: #0284c7; margin-top: 0;">What's Next?</h3>
+            <p style="color: #374151; margin: 10px 0;">
+              If you were charged for this order, the refund will be processed automatically within 5-10 business days.
+            </p>
+            <p style="color: #374151; margin: 15px 0 0 0;">
+              If you have any questions or would like to place a new order, please don't hesitate to contact our support team.
+            </p>
+          </div>
+
+          <!-- Footer -->
+          <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+            <p style="color: #6b7280; font-size: 14px; margin: 10px 0;">If you have any questions about this cancellation, please contact our support team.</p>
+            <p style="margin-top: 20px; color: #111827; font-weight: 600;">Best regards,<br><strong>F&S Smartphones Team</strong></p>
+          </div>
+        </div>
+
+        <!-- Footer Bar -->
+        <div style="background: #f9fafb; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e5e7eb;">
+          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&S Smartphones. All rights reserved.</p>
+        </div>
+      </div>
+    `;
+
+    const result = await emailService.sendEmail({
+      to,
+      subject,
+      html: htmlContent
+    });
+
+    console.log("✅ Cancellation email sent to:", to);
+    return {
+      success: true,
+      message: "Cancellation email sent successfully",
+      messageId: result.messageId,
+      service: emailService.transporter?.name || 'logged'
+    };
+  } catch (error) {
+    console.error("❌ Error sending cancellation email:", error);
+    throw error;
+  }
+};
+
+// Export router as default
+module.exports = router;
+// Also export functions for direct use
+module.exports.sendOrderConfirmationEmail = sendOrderConfirmationEmail;
+module.exports.sendStatusUpdateEmail = sendStatusUpdateEmail;
+module.exports.sendOrderCancellationEmail = sendOrderCancellationEmail;

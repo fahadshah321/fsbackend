@@ -1,0 +1,1327 @@
+const express = require("express");
+const Stripe = require("stripe");
+const jwt = require("jsonwebtoken");
+const axios = require("axios");
+const PDFDocument = require("pdfkit");
+const Order = require("../models/Orders");
+const Product = require("../models/Product");
+const Cart = require("../models/Cart");
+const User = require("../models/User");
+
+// Helper function to get customer name properly - removes duplicates
+// Always prioritizes guestInfo (form data) over userId
+const getCustomerName = (order) => {
+  // First, try to get name from guestInfo (form data)
+  const firstName = (order.guestInfo?.firstName || '').trim();
+  const lastName = (order.guestInfo?.lastName || '').trim();
+  
+  if (firstName || lastName) {
+    // Remove duplicates within firstName or lastName
+    const cleanFirstName = firstName ? firstName.split(/\s+/).filter((v, i, a) => a.indexOf(v) === i).join(' ') : '';
+    const cleanLastName = lastName ? lastName.split(/\s+/).filter((v, i, a) => a.indexOf(v) === i).join(' ') : '';
+    
+    if (cleanFirstName && cleanLastName) {
+      // If firstName already contains lastName, just return firstName
+      if (cleanFirstName.toLowerCase().includes(cleanLastName.toLowerCase())) {
+        return cleanFirstName;
+      }
+      // If lastName already contains firstName, just return lastName
+      if (cleanLastName.toLowerCase().includes(cleanFirstName.toLowerCase())) {
+        return cleanLastName;
+      }
+      // Normal case: combine them with a space
+      return `${cleanFirstName} ${cleanLastName}`;
+    }
+    return cleanFirstName || cleanLastName || 'Guest Customer';
+  }
+  
+  // Fallback to userId name only if no guestInfo exists
+  if (order.userId?.name) {
+    // Clean up user name if it has duplicates
+    const name = (order.userId.name || '').trim();
+    if (name) {
+      const parts = name.split(/\s+/);
+      const uniqueParts = [];
+      parts.forEach(part => {
+        if (part && !uniqueParts.some(existing => existing.toLowerCase() === part.toLowerCase())) {
+          uniqueParts.push(part);
+        }
+      });
+      return uniqueParts.join(' ');
+    }
+    return name;
+  }
+  
+  return 'Guest Customer';
+};
+
+// NEW: Helper function to get API URL (works on both local and server)
+// Note: API_URL already includes /api, so we use it as-is
+const getApiUrl = () => {
+  // For internal server calls, always use localhost (most reliable)
+  // This works on both local and server environments
+  const port = process.env.PORT || 5000;
+  const baseUrl = `http://localhost:${port}`;
+  
+  // If we're in production and have a specific API URL, use it
+  // But prefer localhost for internal calls to avoid network issues
+  if (process.env.NODE_ENV === 'production' && process.env.API_URL) {
+    // Only use external URL if explicitly needed
+    const apiUrl = process.env.API_URL.replace(/\/$/, '');
+    // If API_URL points to same server, use localhost instead
+    if (apiUrl.includes('localhost') || apiUrl.includes('127.0.0.1')) {
+      return `${baseUrl}/api`;
+    }
+    return apiUrl;
+  }
+  
+  // Default to localhost for internal calls
+  return `${baseUrl}/api`;
+};
+
+const router = express.Router();
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
+const { authMiddleware, roleCheck } = require("../middlewares/auth");
+
+function getUserIdFromToken(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return null;
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || process.env.JWT);
+    return decoded.id || decoded._id || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// NEW: Helper function to ensure product has a default variant for stock management
+// Returns the variant to use for stock management (doesn't save the product)
+function ensureDefaultVariant(product) {
+  // If product already has variants, return the first one
+  if (product.variants && product.variants.length > 0) {
+    return product.variants[0];
+  }
+  
+  // Create a default variant for products without variants
+  const defaultVariant = {
+    specs: {},
+    price: product.price,
+    images: product.images || [],
+    sku: `${product.name.replace(/\s+/g, '').toUpperCase().slice(0, 10)}-DEFAULT`,
+    enabled: true,
+    stock: 0 // Initialize stock to 0 if not set
+  };
+  
+  // Add the default variant to the product (will be saved later)
+  if (!product.variants) {
+    product.variants = [];
+  }
+  product.variants.push(defaultVariant);
+  
+  // Return the newly created variant
+  return product.variants[product.variants.length - 1];
+}
+
+// NEW: Stock management - Decrease stock for order items
+async function decreaseOrderStock(order) {
+  try {
+    console.log("Decreasing stock for order:", order._id);
+    
+    for (const item of order.items) {
+      const product = await Product.findById(item.productId);
+      if (!product) {
+        console.warn(`Product not found for item: ${item.productId}`);
+        continue;
+      }
+
+      let variant = null;
+      
+      // If product has variants and item has variantId, find the variant
+      if (product.variants && product.variants.length > 0 && item.variantId) {
+        variant = product.variants.find(v => v._id.toString() === item.variantId.toString());
+        if (!variant) {
+          console.warn(`Variant not found: ${item.variantId} for product: ${item.productId}`);
+        }
+      }
+      
+      // If no variant found (product without variants or variantId not provided)
+      // Ensure product has a default variant and use it
+      if (!variant) {
+        variant = ensureDefaultVariant(product);
+        console.log(`Using default variant for non-variant product: ${product._id}`);
+      }
+      
+      // Decrease stock for the variant
+      if (variant) {
+        const currentStock = variant.stock !== undefined ? variant.stock : 0;
+        const newStock = Math.max(0, currentStock - item.quantity);
+        variant.stock = newStock;
+        console.log(`Decreased stock for variant ${variant._id}: ${currentStock} -> ${newStock} (quantity: ${item.quantity})`);
+      }
+      
+      await product.save();
+    }
+    
+    console.log("Stock decreased successfully for order:", order._id);
+  } catch (error) {
+    console.error("Error decreasing stock for order:", error);
+    throw error;
+  }
+}
+
+// NEW: Stock recovery - Recover stock when order is cancelled
+async function recoverOrderStock(order) {
+  try {
+    console.log("Recovering stock for cancelled order:", order._id);
+    
+    for (const item of order.items) {
+      const product = await Product.findById(item.productId);
+      if (!product) {
+        console.warn(`Product not found for item: ${item.productId}`);
+        continue;
+      }
+
+      let variant = null;
+      
+      // If product has variants and item has variantId, find the variant
+      if (product.variants && product.variants.length > 0 && item.variantId) {
+        variant = product.variants.find(v => v._id.toString() === item.variantId.toString());
+        if (!variant) {
+          console.warn(`Variant not found: ${item.variantId} for product: ${item.productId}`);
+        }
+      }
+      
+      // If no variant found, use default variant
+      if (!variant) {
+        variant = ensureDefaultVariant(product);
+      }
+      
+      // Recover stock for the variant
+      if (variant) {
+        const currentStock = variant.stock !== undefined ? variant.stock : 0;
+        const newStock = currentStock + item.quantity;
+        variant.stock = newStock;
+        console.log(`Recovered stock for variant ${variant._id}: ${currentStock} -> ${newStock} (quantity: ${item.quantity})`);
+      }
+      
+      await product.save();
+    }
+    
+    console.log("Stock recovered successfully for order:", order._id);
+  } catch (error) {
+    console.error("Error recovering stock for order:", error);
+    throw error;
+  }
+}
+
+// NEW: Cancel order function with stock recovery and email
+async function cancelOrder(order, reason = 'user_cancelled') {
+  try {
+    console.log(`Cancelling order ${order._id} - Reason: ${reason}`);
+    
+    // Check if already cancelled
+    if (order.orderStatus === 'Cancelled') {
+      console.log(`Order ${order._id} is already cancelled`);
+      return order;
+    }
+    
+    // Update order status
+    order.orderStatus = 'Cancelled';
+    if (order.paymentStatus === 'Pending') {
+      order.paymentStatus = 'Cancelled';
+    } else if (order.paymentStatus !== 'Paid') {
+      order.paymentStatus = 'Failed';
+    }
+    order.cancelledAt = new Date();
+    order.cancellationReason = reason;
+    await order.save();
+    
+    // Recover stock
+    await recoverOrderStock(order);
+    
+    // Send cancellation email
+    try {
+      const populatedOrder = await Order.findById(order._id)
+        .populate("items.productId", "name price images variants specs")
+        .populate("items.sellerId", "name email")
+        .populate("outletId", "name location address phone email")
+        .populate("userId", "name email phone")
+        .lean();
+
+      // Always prioritize guestInfo (form data) for customer contact details
+      // userId is only for order tracking/profile, not for shipping/contact info
+      const customer = populatedOrder.guestInfo ? {
+        email: populatedOrder.guestInfo.email,
+        phone: populatedOrder.guestInfo.phone,
+        name: getCustomerName(populatedOrder)
+      } : (populatedOrder.userId ? {
+        // Fallback to userId only if no guestInfo exists
+        email: populatedOrder.userId.email,
+        phone: populatedOrder.userId.phone,
+        name: populatedOrder.userId.name
+      } : {
+        email: null,
+        phone: null,
+        name: 'Guest Customer'
+      });
+
+      if (customer.email) {
+        const notificationsModule = require('./notificationsRoutes');
+        const sendOrderCancellationEmail = notificationsModule.sendOrderCancellationEmail;
+        
+        if (sendOrderCancellationEmail) {
+          // Fix: Parameters are (to, order, customerName, reason)
+          await sendOrderCancellationEmail(customer.email, populatedOrder, customer.name, reason);
+          console.log(`✅ Cancellation email sent for order: ${order._id}`);
+        }
+      }
+    } catch (emailError) {
+      console.error('❌ Failed to send cancellation email:', emailError.message);
+      // Don't fail cancellation if email fails
+    }
+    
+    console.log(`✅ Order ${order._id} cancelled successfully`);
+    return order;
+  } catch (error) {
+    console.error(`❌ Error cancelling order ${order._id}:`, error);
+    throw error;
+  }
+}
+
+async function createOrderDocument({ userId, guestInfo, items, total, paymentMethod, deliveryMethod, outletId }) {
+  console.log("Creating order document with items:", items);
+  const products = await Product.find({ _id: { $in: items.map(i => i.productId) } });
+  const order = new Order({
+    userId: userId || undefined, // Set userId if logged in (for order tracking/profile)
+    guestInfo: guestInfo || undefined, // Always use form data for shipping/delivery details, even if logged in
+    items: items.map(item => ({
+      productId: item.productId,
+      sellerId: products.find(p => p._id.equals(item.productId))?.sellerId,
+      variantId: item.variantId,
+      quantity: item.quantity,
+      price: item.price,
+    })),
+    total,
+    paymentMethod: paymentMethod || "Stripe",
+    deliveryMethod: deliveryMethod || "delivery",
+    outletId: deliveryMethod === "pickup" ? outletId : null,
+    paymentStatus: paymentMethod === "Stripe" ? "Pending" : "Pending",
+    orderStatus: "Pending"
+  });
+  await order.save();
+  console.log("Order created:", order._id);
+  
+  // NEW: Decrease stock immediately when order is created (not waiting for payment)
+  if (paymentMethod === "Stripe") {
+    try {
+      await decreaseOrderStock(order);
+      console.log("✅ Stock decreased for pending Stripe order:", order._id);
+    } catch (stockError) {
+      console.error("❌ Failed to decrease stock for order:", stockError);
+      // If stock decrease fails, cancel the order
+      await cancelOrder(order, 'stock_unavailable');
+      throw new Error("Failed to reserve stock for order");
+    }
+  }
+  
+  return order;
+}
+
+// In orderRoutes.js - find the sendOrderNotifications function and update it:
+async function sendOrderNotifications(order, isPickup = false, trackingNumber = null) {
+  try {
+    // Always prioritize guestInfo (form data) for customer contact details
+    const customerEmail = order.guestInfo?.email || order.userId?.email;
+    const customerPhone = order.guestInfo?.phone || order.userId?.phone;
+    const customerName = getCustomerName(order);
+
+    const orderIdStr = order._id.toString();
+    const shortOrderId = orderIdStr.slice(-8);
+
+    // Create simplified order object with items for email
+    const simplifiedOrder = {
+      _id: order._id,
+      outletId: order.outletId,
+      deliveryMethod: order.deliveryMethod,
+      total: order.total,
+      items: order.items || [] // Include items for email template
+    };
+
+    // NEW: Lazy load notification functions to avoid circular dependency
+    const notificationsModule = require('./notificationsRoutes');
+    const sendStatusUpdateEmail = notificationsModule.sendStatusUpdateEmail;
+    
+    if (!sendStatusUpdateEmail) {
+      throw new Error('sendStatusUpdateEmail function not found in notificationsRoutes');
+    }
+    
+    if (isPickup) {
+      // PICKUP READY NOTIFICATION
+      if (customerEmail) {
+        try {
+          const result = await sendStatusUpdateEmail(customerEmail, simplifiedOrder, customerName, 'Ready for Pickup');
+          if (result.success) {
+            console.log("✅ Pickup ready email sent to:", customerEmail);
+            console.log("✅ Email details:", {
+              messageId: result.messageId,
+              service: result.service
+            });
+          }
+        } catch (emailError) {
+          console.error("\n❌ ========== PICKUP EMAIL FAILED ==========");
+          console.error("❌ Order ID:", order._id);
+          console.error("❌ Customer Email:", customerEmail);
+          console.error("❌ Error Message:", emailError.message);
+          console.error("❌ Error Code:", emailError.code || 'NO_CODE');
+          console.error("❌ Full Error:", emailError);
+          console.error("❌ ========================================\n");
+        }
+      }
+
+      // WhatsApp notification (if route exists, otherwise skip)
+      if (customerPhone) {
+        try {
+          const apiUrl = getApiUrl();
+          const pickupMessage = `Hello ${customerName}! Your order #${shortOrderId} is ready for pickup at ${order.outletId?.name || 'the selected outlet'}. Address: ${order.outletId?.address || 'Outlet address'}. Phone: ${order.outletId?.phone || 'N/A'}`;
+          
+          await axios.post(`${apiUrl}/notifications/send-whatsapp`, {
+            to: customerPhone,
+            message: pickupMessage,
+            order: simplifiedOrder,
+            notificationType: 'pickup_ready'
+          }).catch(() => {
+            // WhatsApp route might not exist, that's okay
+            console.log("⚠️ WhatsApp notification skipped (route not available)");
+          });
+        } catch (whatsappError) {
+          // Don't fail if WhatsApp fails
+          console.log("⚠️ WhatsApp notification skipped:", whatsappError.message);
+        }
+      }
+    } else if (trackingNumber) {
+      // TRACKING NOTIFICATION  
+      console.log("📧 TRACKING NOTIFICATION TRIGGERED");
+      console.log("📧 Tracking Number:", trackingNumber);
+      console.log("📧 Customer Email:", customerEmail);
+      console.log("📧 Simplified Order:", JSON.stringify(simplifiedOrder, null, 2));
+      
+      if (customerEmail) {
+        try {
+          console.log("📧 Calling sendStatusUpdateEmail...");
+          const result = await sendStatusUpdateEmail(customerEmail, simplifiedOrder, customerName, 'Shipped', trackingNumber);
+          console.log("📧 sendStatusUpdateEmail result:", result);
+          
+          if (result.success) {
+            console.log("✅ Tracking email sent to:", customerEmail);
+            console.log("✅ Email details:", {
+              messageId: result.messageId,
+              service: result.service,
+              trackingNumber: trackingNumber
+            });
+          } else if (result.skipped) {
+            console.log("⚠️ Tracking email skipped:", result.message);
+          }
+        } catch (emailError) {
+          console.error("\n❌ ========== TRACKING EMAIL FAILED ==========");
+          console.error("❌ Order ID:", order._id);
+          console.error("❌ Customer Email:", customerEmail);
+          console.error("❌ Tracking Number:", trackingNumber);
+          console.error("❌ Error Message:", emailError.message);
+          console.error("❌ Error Code:", emailError.code || 'NO_CODE');
+          console.error("❌ Error Stack:", emailError.stack);
+          console.error("❌ Full Error:", emailError);
+          console.error("❌ ===========================================\n");
+        }
+      } else {
+        console.warn("⚠️ No customer email found, skipping tracking notification");
+      }
+
+      // WhatsApp notification (if route exists, otherwise skip)
+      if (customerPhone) {
+        try {
+          const apiUrl = getApiUrl();
+          const trackingMessage = `Hello ${customerName}! Your order #${shortOrderId} has been shipped. Tracking Number: ${trackingNumber}. Track your order here: ${process.env.FRONTEND_URL}/track-order or directly with DHL: https://www.dhl.com/en/express/tracking.html?AWB=${trackingNumber}`;
+
+          await axios.post(`${apiUrl}/notifications/send-whatsapp`, {
+            to: customerPhone,
+            message: trackingMessage,
+            order: simplifiedOrder,
+            notificationType: 'tracking'
+          }).catch(() => {
+            // WhatsApp route might not exist, that's okay
+            console.log("⚠️ WhatsApp notification skipped (route not available)");
+          });
+        } catch (whatsappError) {
+          // Don't fail if WhatsApp fails
+          console.log("⚠️ WhatsApp notification skipped:", whatsappError.message);
+        }
+      }
+    }
+
+    console.log("✅ Notifications sent successfully for order:", order._id);
+  } catch (notificationError) {
+    console.error("❌ Failed to send notifications:", notificationError.message);
+    // Don't fail the order processing if notifications fail
+  }
+}
+// NEW: Handle Stripe cancel URL - cancel order when user clicks back/cancel
+router.get("/stripe-cancel", async (req, res) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id) {
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/cancel?error=no_session`);
+    }
+
+    // Get session from Stripe to find order
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    const orderId = session.metadata?.orderId || session.client_reference_id;
+
+    if (orderId) {
+      const order = await Order.findById(orderId);
+      if (order && order.paymentStatus === 'Pending' && order.orderStatus !== 'Cancelled') {
+        // Cancel the order and recover stock
+        await cancelOrder(order, 'stripe_cancelled');
+        console.log(`✅ Order ${orderId} cancelled due to Stripe cancel`);
+      }
+    }
+
+    // Redirect to cancel page
+    return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/cancel?session_id=${session_id}`);
+  } catch (err) {
+    console.error("Stripe cancel handler error:", err);
+    return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/cancel?error=processing_failed`);
+  }
+});
+
+// Stripe checkout for home delivery
+router.post("/stripe", async (req, res) => {
+  try {
+    const { items = [], guestInfo = null, deliveryMethod = "delivery", outletId = null } = req.body;
+    const userId = getUserIdFromToken(req);
+    if (!items || !items.length) return res.status(400).json({ message: "No items provided" });
+
+    console.log("Stripe checkout request:", { items, guestInfo, userId, deliveryMethod, outletId });
+
+    const total = items.reduce((s, it) => s + (it.price || 0) * (it.quantity || 1), 0);
+
+    // NEW: Fetch product names for items missing names
+    const itemsWithNames = await Promise.all(items.map(async (item) => {
+      if (!item.name && item.productId) {
+        try {
+          const product = await Product.findById(item.productId);
+          if (product) {
+            item.name = product.name;
+            // Also get image if missing
+            if (!item.image && product.images && product.images.length > 0) {
+              item.image = product.images[0];
+            }
+          }
+        } catch (err) {
+          console.error(`Error fetching product ${item.productId}:`, err);
+        }
+      }
+      // Ensure name is always provided - use fallback if still missing
+      if (!item.name) {
+        item.name = `Product ${item.productId || 'Unknown'}`;
+      }
+      return item;
+    }));
+
+    const order = await createOrderDocument({ 
+      userId, 
+      guestInfo, 
+      items: itemsWithNames, 
+      total, 
+      paymentMethod: "Stripe",
+      deliveryMethod,
+      outletId
+    });
+
+    const lineItems = itemsWithNames.map((item) => {
+      return {
+        price_data: {
+          currency: "eur", // Changed to EUR for Germany
+          product_data: {
+            name: item.name, // Now guaranteed to have a value
+            images: item.image ? [item.image] : [],
+          },
+          unit_amount: Math.round((item.price || 0) * 100),
+        },
+        quantity: item.quantity || 1,
+      };
+    });
+
+    if (!process.env.FRONTEND_URL || !/^https?:\/\//i.test(process.env.FRONTEND_URL)) {
+      console.warn("FRONTEND_URL is missing or invalid in .env. Should include http:// or https://");
+      return res.status(500).json({ message: "Server misconfiguration: FRONTEND_URL must include http:// or https:// in .env" });
+    }
+
+    // Build cancel URL - use backend URL (not frontend) since it's a backend route
+    let cancelUrlBase;
+    if (process.env.API_URL) {
+      // If API_URL is set, remove /api suffix if present, then add /api/orders/stripe-cancel
+      cancelUrlBase = process.env.API_URL.replace(/\/api\/?$/, '').replace(/\/$/, '');
+    } else {
+      // Fallback to localhost with port
+      const port = process.env.PORT || 5000;
+      cancelUrlBase = `http://localhost:${port}`;
+    }
+    const cancelUrl = `${cancelUrlBase}/api/orders/stripe-cancel?session_id={CHECKOUT_SESSION_ID}`;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card", "klarna"],
+      mode: "payment",
+      line_items: lineItems,
+      success_url: `${process.env.FRONTEND_URL.replace(/\/$/, "")}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      metadata: {
+        orderId: order._id.toString()
+      },
+      client_reference_id: order._id.toString()
+    });
+
+    order.stripeSessionId = session.id;
+    await order.save();
+
+    console.log("Stripe session created:", session.id);
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("Stripe Checkout Error:", err);
+    return res.status(500).json({ message: "Failed to create checkout session" });
+  }
+});
+
+// Pickup order endpoint
+router.post("/pickup", async (req, res) => {
+  try {
+    const { items = [], total = 0, guestInfo = null, outletId = null } = req.body;
+    const userId = getUserIdFromToken(req);
+
+    console.log("Pickup order request:", { items, total, guestInfo, userId, outletId });
+
+    if (!items || !items.length) return res.status(400).json({ message: "No items provided" });
+
+    if (!outletId) {
+      return res.status(400).json({ message: "Outlet selection is required for pickup orders" });
+    }
+
+    const order = await createOrderDocument({ 
+      userId, 
+      guestInfo, 
+      items, 
+      total, 
+      paymentMethod: "Pickup",
+      deliveryMethod: "pickup",
+      outletId
+    });
+
+    // NEW: Stock management - Decrease stock for pickup orders immediately
+    await decreaseOrderStock(order);
+
+    if (userId) {
+      try {
+        await Cart.findOneAndDelete({ userId });
+        console.log("Cart cleared for user:", userId);
+      } catch (e) {
+        console.warn("Failed to clear DB cart after pickup order:", e.message);
+      }
+    }
+
+    await sendOrderConfirmation(order);
+
+    console.log("Pickup order placed successfully:", order._id);
+    return res.status(201).json({ 
+      message: `Pickup order placed successfully! Ready for pickup at selected outlet.`, 
+      order 
+    });
+  } catch (err) {
+    console.error("Pickup Order Error:", err);
+    return res.status(500).json({ message: "Failed to place pickup order" });
+  }
+});
+
+// Get user orders
+router.get("/", async (req, res) => {
+  try {
+    const userId = getUserIdFromToken(req);
+    if (!userId) return res.status(401).json({ message: "Login required" });
+
+    console.log("Fetching orders for user:", userId);
+
+    const orders = await Order.find({ userId })
+      .populate("items.productId", "name price images")
+      .populate("items.sellerId", "name email")
+      .populate("outletId", "name location address phone")
+      .sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    console.error("Error fetching orders:", err);
+    res.status(500).json({ message: "Failed to fetch orders" });
+  }
+});
+
+// Get seller orders
+router.get("/seller", async (req, res) => {
+  try {
+    const userId = getUserIdFromToken(req);
+    if (!userId) return res.status(401).json({ message: "Login required" });
+
+    console.log("Fetching seller orders for user:", userId);
+
+    const orders = await Order.find({ "items.sellerId": userId })
+      .populate("items.productId", "name price images")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .sort({ createdAt: -1 });
+
+    const transformed = orders.map(o => {
+      const myItems = o.items.filter(it => it.sellerId && it.sellerId.toString() === userId.toString());
+      return {
+        _id: o._id,
+        userId: o.userId,
+        guestInfo: o.guestInfo,
+        total: o.total,
+        paymentMethod: o.paymentMethod,
+        paymentStatus: o.paymentStatus,
+        orderStatus: o.orderStatus,
+        deliveryMethod: o.deliveryMethod,
+        outletId: o.outletId,
+        createdAt: o.createdAt,
+        items: myItems
+      };
+    });
+
+    res.json(transformed);
+  } catch (err) {
+    console.error("Error fetching seller orders:", err);
+    res.status(500).json({ message: "Failed to fetch seller orders" });
+  }
+});
+
+// Get all orders for admin with full details
+router.get("/all", authMiddleware, roleCheck(["admin","company"]), async (req, res) => {
+  try {
+    console.log("Fetching all orders for admin");
+    const orders = await Order.find()
+      .populate("items.productId", "name price images variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch all orders" });
+  }
+});
+
+// NEW: Get cancelled orders for admin
+router.get("/cancelled", authMiddleware, roleCheck(["admin","company"]), async (req, res) => {
+  try {
+    console.log("Fetching cancelled orders for admin");
+    const orders = await Order.find({ orderStatus: "Cancelled" })
+      .populate("items.productId", "name price images variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .sort({ cancelledAt: -1, createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch cancelled orders" });
+  }
+});
+
+// Get seller candidate orders for admin
+router.get("/admin/seller-candidates", authMiddleware, roleCheck(["admin","company"]), async (req, res) => {
+  try {
+    console.log("Fetching seller candidate orders");
+    const sellerCandidates = await User.find({ role: "seller_candidate" });
+    const sellerCandidateIds = sellerCandidates.map(s => s._id);
+    
+    const orders = await Order.find({ "items.sellerId": { $in: sellerCandidateIds } })
+      .populate("items.productId", "name price images variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .sort({ createdAt: -1 });
+
+    res.json(orders);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch seller candidate orders" });
+  }
+});
+
+// Process order - No stock management
+router.post("/:orderId/process", authMiddleware, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userId = getUserIdFromToken(req);
+    const { trackingNumber, isPickup = false } = req.body;
+    console.log(trackingNumber)
+    console.log("Processing order:", orderId, "by user:", userId, "isPickup:", isPickup);
+
+    if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+    const order = await Order.findById(orderId)
+      .populate("items.productId", "name price images variants specs")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone");
+
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    let canProcess = false;
+
+    if (req.user.role === "company" || req.user.role === "admin") {
+      canProcess = true;
+    } else if (req.user.role === "seller_candidate" || req.user.role === "seller") {
+      canProcess = order.items.some(item => item.sellerId?.toString() === userId.toString());
+    }
+
+    if (!canProcess)
+      return res.status(403).json({ message: "You cannot process this order" });
+
+    // Update order status only - No stock management
+    order.orderStatus = "Processing";
+    
+    if (trackingNumber && order.deliveryMethod === "delivery") {
+      order.trackingNumber = trackingNumber;
+    }
+
+    order.updatedAt = Date.now();
+    await order.save();
+
+    // Re-fetch order with all populated fields to ensure data is fresh
+    const updatedOrder = await Order.findById(orderId)
+      .populate("items.productId", "name price images variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .populate("guestInfo");
+
+    console.log("📧 About to send notifications...");
+    console.log("📧 Order details:", {
+      orderId: updatedOrder._id,
+      deliveryMethod: updatedOrder.deliveryMethod,
+      isPickup: isPickup,
+      trackingNumber: trackingNumber,
+      customerEmail: updatedOrder.userId?.email || updatedOrder.guestInfo?.email,
+      hasItems: !!updatedOrder.items && updatedOrder.items.length > 0,
+      itemsCount: updatedOrder.items?.length || 0
+    });
+
+    try {
+      await sendOrderNotifications(updatedOrder, isPickup, trackingNumber);
+      console.log("✅ Notifications sent successfully");
+    } catch (notificationError) {
+      console.error("❌ Failed to send notifications:", notificationError);
+      console.error("❌ Error stack:", notificationError.stack);
+      // Don't fail the request if notifications fail
+    }
+
+    console.log("Order processed successfully:", orderId);
+    
+    res.json({ 
+      message: "Order processed successfully", 
+      order,
+      notification: isPickup ? "Pickup notification sent" : "Tracking information added"
+    });
+  } catch (err) {
+    console.error("Error processing order:", err);
+    res.status(500).json({ message: err.message || "Failed to process order" });
+  }
+});
+
+// NEW: Lazy load the email function to avoid circular dependency and timing issues
+// This ensures it works reliably on servers (Vercel, Railway, etc.)
+async function sendOrderConfirmation(order) {
+  try {
+    // Populate order with product details before sending
+    const populatedOrder = await Order.findById(order._id)
+      .populate("items.productId", "name price images variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("outletId", "name location address phone email")
+      .populate("userId", "name email phone")
+      .lean();
+
+    const customer = populatedOrder.userId ? {
+      email: populatedOrder.userId.email,
+      phone: populatedOrder.userId.phone,
+      name: populatedOrder.userId.name
+    } : {
+      email: populatedOrder.guestInfo?.email,
+      phone: populatedOrder.guestInfo?.phone,
+      name: getCustomerName(populatedOrder)
+    };
+
+    console.log('📧 Attempting to send order confirmation...', {
+      customerEmail: customer.email,
+      orderId: populatedOrder._id
+    });
+
+    // NEW: Lazy load the function to avoid circular dependency issues on server
+    // This ensures the module is fully loaded before we try to use it
+    const notificationsModule = require('./notificationsRoutes');
+    const sendOrderConfirmationEmail = notificationsModule.sendOrderConfirmationEmail;
+    
+    if (!sendOrderConfirmationEmail) {
+      throw new Error('sendOrderConfirmationEmail function not found in notificationsRoutes');
+    }
+
+    // Call the email function directly instead of HTTP request
+    const result = await sendOrderConfirmationEmail(populatedOrder, customer);
+    
+    if (result.success) {
+      console.log("✅ Order confirmation notification sent for order:", populatedOrder._id);
+      console.log("✅ Email details:", {
+        messageId: result.messageId,
+        service: result.service,
+        to: customer.email
+      });
+    } else if (result.skipped) {
+      console.log("⚠️ Order confirmation skipped:", result.message);
+    }
+  } catch (error) {
+    // Detailed error logging
+    console.error("\n❌ ========== ORDER CONFIRMATION EMAIL FAILED ==========");
+    console.error("❌ Order ID:", populatedOrder._id);
+    console.error("❌ Customer Email:", customer.email);
+    console.error("❌ Error Message:", error.message);
+    console.error("❌ Error Code:", error.code || 'NO_CODE');
+    console.error("❌ Full Error:", error);
+    console.error("❌ =====================================================\n");
+    // Don't fail the order creation if notification fails, but log it clearly
+  }
+}
+
+// Add tracking number
+router.put("/:orderId/tracking", authMiddleware, roleCheck(["admin", "company"]), async (req, res) => {
+  try {
+    const { trackingNumber } = req.body;
+    const order = await Order.findByIdAndUpdate(
+      req.params.orderId,
+      { 
+        trackingNumber,
+        orderStatus: "Processing",
+        updatedAt: Date.now()
+      },
+      { new: true }
+    ).populate("userId", "name email phone")
+     .populate("guestInfo")
+     .populate("outletId", "name location address phone")
+     .populate("items.productId", "name price images variants specs");
+
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    try {
+      // NEW: Use direct function call instead of HTTP request
+      // Lazy load the notification function to avoid circular dependency
+      const notificationsModule = require('./notificationsRoutes');
+      const sendStatusUpdateEmail = notificationsModule.sendStatusUpdateEmail;
+      
+      if (!sendStatusUpdateEmail) {
+        throw new Error('sendStatusUpdateEmail function not found in notificationsRoutes');
+      }
+
+      const customerEmail = order.userId?.email || order.guestInfo?.email;
+      const customerPhone = order.userId?.phone || order.guestInfo?.phone;
+      const customerName = getCustomerName(order);
+
+      // Create simplified order object for email
+      const simplifiedOrder = {
+        _id: order._id,
+        outletId: order.outletId,
+        deliveryMethod: order.deliveryMethod,
+        total: order.total,
+        items: order.items || []
+      };
+
+      if (order.deliveryMethod === 'delivery' && trackingNumber) {
+        // TRACKING NOTIFICATION FOR DELIVERY
+        if (customerEmail) {
+          try {
+            const result = await sendStatusUpdateEmail(customerEmail, simplifiedOrder, customerName, 'Shipped', trackingNumber);
+            if (result.success) {
+              console.log("✅ Tracking email sent to:", customerEmail);
+              console.log("✅ Email details:", {
+                messageId: result.messageId,
+                service: result.service,
+                trackingNumber: trackingNumber
+              });
+            }
+          } catch (emailError) {
+            console.error("\n❌ ========== TRACKING EMAIL FAILED ==========");
+            console.error("❌ Order ID:", order._id);
+            console.error("❌ Customer Email:", customerEmail);
+            console.error("❌ Tracking Number:", trackingNumber);
+            console.error("❌ Error Message:", emailError.message);
+            console.error("❌ ===========================================\n");
+          }
+        }
+
+        // WhatsApp notification (if route exists, otherwise skip)
+        if (customerPhone) {
+          try {
+            const apiUrl = getApiUrl();
+            const whatsappMessage = `Your order #${order._id.slice(-8)} has been shipped! 🚚\n\nTracking Number: ${trackingNumber}\nTrack your package: https://www.dhl.com/en/express/tracking.html?AWB=${trackingNumber}\n\nYour order will arrive soon!`;
+            
+            await axios.post(`${apiUrl}/notifications/send-whatsapp`, {
+              to: customerPhone,
+              message: whatsappMessage
+            }).catch(() => {
+              console.log("⚠️ WhatsApp notification skipped (route not available)");
+            });
+          } catch (whatsappError) {
+            console.log("⚠️ WhatsApp notification skipped:", whatsappError.message);
+          }
+        }
+
+      } else if (order.deliveryMethod === 'pickup') {
+        // PICKUP READY NOTIFICATION
+        if (customerEmail) {
+          try {
+            const result = await sendStatusUpdateEmail(customerEmail, simplifiedOrder, customerName, 'Ready for Pickup');
+            if (result.success) {
+              console.log("✅ Pickup ready email sent to:", customerEmail);
+              console.log("✅ Email details:", {
+                messageId: result.messageId,
+                service: result.service
+              });
+            }
+          } catch (emailError) {
+            console.error("\n❌ ========== PICKUP EMAIL FAILED ==========");
+            console.error("❌ Order ID:", order._id);
+            console.error("❌ Customer Email:", customerEmail);
+            console.error("❌ Error Message:", emailError.message);
+            console.error("❌ ===========================================\n");
+          }
+        }
+
+        // WhatsApp notification (if route exists, otherwise skip)
+        if (customerPhone) {
+          try {
+            const apiUrl = getApiUrl();
+            const whatsappMessage = `Your order #${order._id.slice(-8)} is ready for pickup! 🎉\n\n📍 Pickup Location:\n${order.outletId?.name}\n${order.outletId?.address}\n${order.outletId?.location}\n\n🕒 Hours: 9AM-8PM (Mon-Sun)\n\nPlease bring your order confirmation and ID.\n\nWe can't wait to see you!`;
+            
+            await axios.post(`${apiUrl}/notifications/send-whatsapp`, {
+              to: customerPhone,
+              message: whatsappMessage
+            }).catch(() => {
+              console.log("⚠️ WhatsApp notification skipped (route not available)");
+            });
+          } catch (whatsappError) {
+            console.log("⚠️ WhatsApp notification skipped:", whatsappError.message);
+          }
+        }
+      }
+
+      console.log("✅ Notifications sent for tracking update");
+    } catch (notificationError) {
+      console.error("❌ Failed to send notifications:", notificationError.message);
+      // Don't fail the request if notifications fail
+    }
+
+    res.json({ message: "Tracking number added and notifications sent successfully", order });
+  } catch (err) {
+    console.error("Error adding tracking number:", err);
+    res.status(500).json({ message: "Failed to add tracking number" });
+  }
+});
+
+// Track order by ID or tracking number
+router.get("/track/:orderId", async (req, res) => {
+  try {
+    const searchTerm = req.params.orderId.trim();
+    
+    if (!searchTerm) {
+      return res.status(400).json({ message: "Please provide an order ID or tracking number" });
+    }
+    
+    console.log("🔍 Searching for order with term:", searchTerm);
+    
+    // Check if search term is a valid MongoDB ObjectId (24 hex characters)
+    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(searchTerm);
+    
+    let order = null;
+    
+    // Helper function to populate order with all necessary fields
+    const populateOrder = (orderQuery) => {
+      return orderQuery
+        .populate("items.productId", "name images variants specs")
+        .populate("items.sellerId", "name")
+        .populate("outletId", "name location address phone")
+        .populate("userId", "name email phone")
+        .select("-stripeSessionId");
+    };
+    
+    // FIRST: Try to find by tracking number (most common use case for tracking)
+    // Search for exact match (case-sensitive for tracking numbers)
+    order = await populateOrder(
+      Order.findOne({ trackingNumber: searchTerm })
+    );
+    
+    if (order) {
+      console.log("✅ Found order by tracking number:", order._id);
+      console.log("📋 Order guestInfo:", order.guestInfo);
+      console.log("📋 Order userId:", order.userId);
+      return res.json(order);
+    }
+    
+    // SECOND: If not found by tracking number and search term is a valid ObjectId, try by order ID
+    if (isValidObjectId) {
+      try {
+        order = await populateOrder(
+          Order.findById(searchTerm)
+        );
+        
+        if (order) {
+          console.log("✅ Found order by ObjectId:", order._id);
+          console.log("📋 Order guestInfo:", order.guestInfo);
+          console.log("📋 Order userId:", order.userId);
+          return res.json(order);
+        }
+      } catch (idError) {
+        // If findById throws an error, continue to next search
+        console.log("⚠️ Invalid ObjectId format, trying other search methods");
+      }
+    }
+    
+    // THIRD: If still not found and search term is 8 characters, try to match by last 8 characters of order ID
+    if (!order && searchTerm.length === 8) {
+      try {
+        // Find all orders and filter by last 8 characters of _id
+        const allOrders = await populateOrder(
+          Order.find({})
+        ).lean();
+        
+        // Find order where last 8 characters of _id match
+        order = allOrders.find(o => {
+          const orderIdStr = o._id.toString();
+          return orderIdStr.slice(-8).toLowerCase() === searchTerm.toLowerCase();
+        });
+        
+        if (order) {
+          console.log("✅ Found order by last 8 characters:", order._id);
+          console.log("📋 Order guestInfo:", order.guestInfo);
+          console.log("📋 Order userId:", order.userId);
+          return res.json(order);
+        }
+      } catch (searchError) {
+        console.log("⚠️ Error in partial ID search:", searchError.message);
+      }
+    }
+    
+    console.log("❌ Order not found for search term:", searchTerm);
+    return res.status(404).json({ 
+      message: "Order not found. Please check your order ID or tracking number." 
+    });
+    
+  } catch (err) {
+    console.error("❌ Error tracking order:", err);
+    res.status(500).json({ message: "Failed to track order" });
+  }
+});
+
+// NEW: Export processed orders to PDF
+router.get("/processed/export-pdf", authMiddleware, roleCheck(["admin", "company"]), async (req, res) => {
+  try {
+    const { orderIds } = req.query;
+    let orderIdArray = [];
+    
+    if (orderIds) {
+      if (Array.isArray(orderIds)) {
+        orderIdArray = orderIds;
+      } else if (typeof orderIds === 'string') {
+        // Handle comma-separated string
+        orderIdArray = orderIds.split(',').filter(id => id.trim());
+      } else {
+        orderIdArray = [orderIds];
+      }
+    }
+
+    // Fetch processed orders
+    let query = { orderStatus: "Processing" };
+    if (orderIdArray.length > 0) {
+      query._id = { $in: orderIdArray };
+    }
+
+    const orders = await Order.find(query)
+      .populate("items.productId", "name price variants specs")
+      .populate("items.sellerId", "name email")
+      .populate("userId", "name email phone")
+      .populate("outletId", "name location address phone")
+      .sort({ updatedAt: -1 });
+
+    if (orders.length === 0) {
+      return res.status(404).json({ message: "No processed orders found" });
+    }
+
+    // Create PDF
+    const doc = new PDFDocument({ margin: 50 });
+    const filename = `processed-orders-${Date.now()}.pdf`;
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+
+    // Header
+    doc.fontSize(20).text("Processed Orders Report", { align: "center" });
+    doc.moveDown();
+    doc.fontSize(12).text(`Generated on: ${new Date().toLocaleString()}`, { align: "center" });
+    doc.fontSize(10).text(`Total Orders: ${orders.length}`, { align: "center" });
+    doc.moveDown(2);
+
+    let yPosition = doc.y;
+    let pageNumber = 1;
+
+    orders.forEach((order, index) => {
+      // Check if we need a new page
+      if (yPosition > 700) {
+        doc.addPage();
+        yPosition = 50;
+        pageNumber++;
+      }
+
+      // Order Header
+      doc.fontSize(14).fillColor("black").text(`Order #${order._id.toString().slice(-8)}`, { continued: false });
+      doc.fontSize(10).fillColor("gray").text(`Date: ${new Date(order.createdAt).toLocaleDateString()}`, { continued: true });
+      doc.text(` | Processed: ${new Date(order.updatedAt).toLocaleDateString()}`, { continued: true });
+      doc.moveDown(0.5);
+
+      // Customer Information
+      doc.fontSize(11).fillColor("black").text("Customer Information:", { underline: true });
+      const customerName = getCustomerName(order);
+      doc.fontSize(10).fillColor("black").text(`Name: ${customerName}`);
+      
+      // Always prioritize guestInfo (form data) for customer contact details
+      if (order.guestInfo) {
+        doc.text(`Email: ${order.guestInfo.email || "N/A"}`);
+        doc.text(`Phone: ${order.guestInfo.phone || "N/A"}`);
+        if (order.guestInfo.address) {
+          doc.text(`Address: ${order.guestInfo.address}`);
+        }
+      } else if (order.userId) {
+        // Fallback to userId only if no guestInfo exists
+        doc.text(`Email: ${order.userId.email || "N/A"}`);
+        doc.text(`Phone: ${order.userId.phone || "N/A"}`);
+      }
+      doc.moveDown(0.5);
+
+      // Order Items
+      doc.fontSize(11).fillColor("black").text("Order Items:", { underline: true });
+      order.items.forEach((item, itemIndex) => {
+        const productName = item.productId?.name || "Product not found";
+        const sellerName = item.sellerId?.name || "Unknown Seller";
+        const quantity = item.quantity;
+        const price = item.price;
+        const itemTotal = quantity * price;
+
+        doc.fontSize(10).fillColor("black")
+          .text(`${itemIndex + 1}. ${productName}`, { continued: false })
+          .text(`   Seller: ${sellerName}`, { indent: 20 });
+
+        // Get variant details if available
+        if (item.variantId && item.productId?.variants && Array.isArray(item.productId.variants)) {
+          const variant = item.productId.variants.find(
+            v => v._id && v._id.toString() === item.variantId.toString()
+          );
+          
+          if (variant && variant.specs) {
+            // Convert specs to object if it's a Map
+            const specs = variant.specs instanceof Map 
+              ? Object.fromEntries(variant.specs) 
+              : variant.specs;
+            
+            // Display variant specs
+            const specsEntries = Object.entries(specs);
+            if (specsEntries.length > 0) {
+              doc.fontSize(9).fillColor("gray").text(`   Variant:`, { indent: 20 });
+              specsEntries.forEach(([key, value]) => {
+                doc.fontSize(9).fillColor("gray")
+                  .text(`     • ${key.charAt(0).toUpperCase() + key.slice(1)}: ${value}`, { indent: 30 });
+              });
+            }
+          }
+        }
+
+        doc.fontSize(10).fillColor("black")
+          .text(`   Quantity: ${quantity} x €${price.toFixed(2)} = €${itemTotal.toFixed(2)}`, { indent: 20 });
+      });
+      doc.moveDown(0.5);
+
+      // Order Summary
+      doc.fontSize(11).fillColor("black").text("Order Summary:", { underline: true });
+      doc.fontSize(10).fillColor("black")
+        .text(`Payment Method: ${order.paymentMethod}`)
+        .text(`Delivery Method: ${order.deliveryMethod}`);
+      if (order.trackingNumber) {
+        doc.text(`Tracking Number: ${order.trackingNumber}`);
+      }
+      if (order.outletId) {
+        doc.text(`Pickup Outlet: ${order.outletId.name} - ${order.outletId.location || ""}`);
+      }
+      doc.fontSize(12).fillColor("green").text(`Total: €${order.total.toFixed(2)}`, { align: "right" });
+
+      // Separator
+      doc.moveDown(1);
+      doc.strokeColor("gray").lineWidth(0.5).moveTo(50, doc.y).lineTo(550, doc.y).stroke();
+      doc.moveDown(1);
+
+      yPosition = doc.y;
+    });
+
+    // Footer
+    doc.fontSize(8).fillColor("gray").text(`Page ${pageNumber}`, 50, doc.page.height - 50, { align: "center" });
+
+    doc.end();
+  } catch (err) {
+    console.error("Error generating PDF:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
+// NEW: Bulk delete processed orders
+router.delete("/processed/bulk-delete", authMiddleware, roleCheck(["admin", "company"]), async (req, res) => {
+  try {
+    const { orderIds } = req.body;
+
+    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({ message: "Order IDs array is required" });
+    }
+
+    // Verify all orders are processed before deleting
+    const orders = await Order.find({
+      _id: { $in: orderIds },
+      orderStatus: "Processing"
+    });
+
+    if (orders.length === 0) {
+      return res.status(404).json({ message: "No processed orders found with the provided IDs" });
+    }
+
+    // Delete the orders
+    const deleteResult = await Order.deleteMany({
+      _id: { $in: orderIds },
+      orderStatus: "Processing"
+    });
+
+    res.json({
+      message: `Successfully deleted ${deleteResult.deletedCount} processed order(s)`,
+      deletedCount: deleteResult.deletedCount
+    });
+  } catch (err) {
+    console.error("Error deleting processed orders:", err);
+    res.status(500).json({ message: "Failed to delete processed orders" });
+  }
+});
+
+// Export router as default, but also attach functions to it
+router.cancelOrder = cancelOrder;
+router.recoverOrderStock = recoverOrderStock;
+router.decreaseOrderStock = decreaseOrderStock;
+
+module.exports = router;
