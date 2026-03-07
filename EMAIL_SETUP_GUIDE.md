@@ -22,7 +22,7 @@ Resend uses HTTPS API (not SMTP), so it works on all servers.
 ### Step 2: Get API Key
 1. Go to [API Keys](https://resend.com/api-keys)
 2. Click "Create API Key"
-3. Name it "F&S Smartphones Production"
+3. Name it "F&s smartphones Production"
 4. Copy the key (starts with `re_`)
 
 ### Step 3: Add Domain (Optional but Recommended)
@@ -42,9 +42,7 @@ Resend uses HTTPS API (not SMTP), so it works on all servers.
 
 # Add Resend:
 RESEND_API_KEY=re_your_api_key_here
-EMAIL_FROM=F&S Smartphones <onboarding@resend.dev>
-# OR if you verified a domain:
-EMAIL_FROM=F&S Smartphones <noreply@yourdomain.com>
+EMAIL_FROM=F&s smartphones <noreply@fundssmartphones.de>
 ```
 
 ### Step 5: Restart Server
@@ -109,7 +107,7 @@ If you really want to use Gmail on cloud servers, you need OAuth2:
 ```env
 # Production (Resend)
 RESEND_API_KEY=re_your_key_here
-EMAIL_FROM=F&S Smartphones <noreply@yourdomain.com>
+EMAIL_FROM=F&s smartphones <noreply@fundssmartphones.de>
 
 # Local Development (Gmail - optional)
 # EMAIL_USER=your-email@gmail.com
