@@ -45,7 +45,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   // "http://localhost:5173",
   "https://fundssmartphones.de",
-  "https://www.fundssmartphones.de/"
+  "https://www.fundssmartphones.de"
   // "https://recycle-trade.vercel.app",
 ];
 
