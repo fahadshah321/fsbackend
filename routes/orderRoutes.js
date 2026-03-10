@@ -835,24 +835,32 @@ router.post("/:orderId/process", authMiddleware, async (req, res) => {
   }
 });
 
+// Helper to sanitize email addresses before sending (trim spaces / stray slashes)
+function sanitizeEmail(email) {
+  if (!email) return email;
+  return String(email).trim().replace(/[\\\s]+$/g, '');
+}
+
 // NEW: Lazy load the email function to avoid circular dependency and timing issues
 // This ensures it works reliably on servers (Vercel, Railway, etc.)
 async function sendOrderConfirmation(order) {
+  let populatedOrder;
+  let customer;
   try {
     // Populate order with product details before sending
-    const populatedOrder = await Order.findById(order._id)
+    populatedOrder = await Order.findById(order._id)
       .populate("items.productId", "name price images variants specs")
       .populate("items.sellerId", "name email")
       .populate("outletId", "name location address phone email")
       .populate("userId", "name email phone")
       .lean();
 
-    const customer = populatedOrder.userId ? {
-      email: populatedOrder.userId.email,
+    customer = populatedOrder.userId ? {
+      email: sanitizeEmail(populatedOrder.userId.email),
       phone: populatedOrder.userId.phone,
       name: populatedOrder.userId.name
     } : {
-      email: populatedOrder.guestInfo?.email,
+      email: sanitizeEmail(populatedOrder.guestInfo?.email),
       phone: populatedOrder.guestInfo?.phone,
       name: getCustomerName(populatedOrder)
     };
@@ -887,8 +895,12 @@ async function sendOrderConfirmation(order) {
   } catch (error) {
     // Detailed error logging
     console.error("\n❌ ========== ORDER CONFIRMATION EMAIL FAILED ==========");
-    console.error("❌ Order ID:", populatedOrder._id);
-    console.error("❌ Customer Email:", customer.email);
+    if (populatedOrder?._id) {
+      console.error("❌ Order ID:", populatedOrder._id);
+    }
+    if (customer?.email) {
+      console.error("❌ Customer Email:", customer.email);
+    }
     console.error("❌ Error Message:", error.message);
     console.error("❌ Error Code:", error.code || 'NO_CODE');
     console.error("❌ Full Error:", error);

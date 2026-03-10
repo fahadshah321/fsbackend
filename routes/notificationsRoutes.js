@@ -685,10 +685,24 @@ const sendOrderConfirmationEmail = async (order, customer) => {
             v._id?.toString() === item.variantId?.toString()
           );
           if (variant && variant.specs) {
-            const specs = variant.specs instanceof Map 
+            let specs = variant.specs instanceof Map 
               ? Object.fromEntries(variant.specs) 
               : variant.specs;
-            const specsEntries = Object.entries(specs);
+
+            // Helper: detect battery spec keys
+            const isBatteryKey = (key) => {
+              const normalized = String(key || '').toLowerCase();
+              return normalized === 'battery condition' || normalized === 'battery';
+            };
+
+            // For ALL products, hide battery-related specs from email item summary
+            if (specs && typeof specs === 'object') {
+              specs = Object.fromEntries(
+                Object.entries(specs).filter(([key]) => !isBatteryKey(key))
+              );
+            }
+
+            const specsEntries = Object.entries(specs || {});
             if (specsEntries.length > 0) {
               variantInfo = `<div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px;">${specsEntries.map(([key, value]) => 
                 `<span style="background: #f3f4f6; padding: 4px 8px; border-radius: 4px; font-size: 11px; color: #374151; border: 1px solid #e5e7eb;"><strong style="text-transform: capitalize;">${key}:</strong> ${value}</span>`
@@ -904,10 +918,24 @@ const sendStatusUpdateEmail = async (to, order, customerName, status, trackingNu
             v._id?.toString() === item.variantId?.toString()
           );
           if (variant && variant.specs) {
-            const specs = variant.specs instanceof Map 
+            let specs = variant.specs instanceof Map 
               ? Object.fromEntries(variant.specs) 
               : variant.specs;
-            const specsEntries = Object.entries(specs);
+
+            // Helper: detect battery spec keys
+            const isBatteryKey = (key) => {
+              const normalized = String(key || '').toLowerCase();
+              return normalized === 'battery condition' || normalized === 'battery';
+            };
+
+            // For ALL products, hide battery-related specs from status update emails (including Ready for Pickup / Shipped)
+            if (specs && typeof specs === 'object') {
+              specs = Object.fromEntries(
+                Object.entries(specs).filter(([key]) => !isBatteryKey(key))
+              );
+            }
+
+            const specsEntries = Object.entries(specs || {});
             if (specsEntries.length > 0) {
               variantInfo = `<div style="margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px;">${specsEntries.map(([key, value]) => 
                 `<span style="background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 10px; color: #374151; border: 1px solid #e5e7eb;"><strong style="text-transform: capitalize;">${key}:</strong> ${value}</span>`
