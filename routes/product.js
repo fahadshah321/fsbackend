@@ -153,20 +153,49 @@
       };
 
       // Helper function to get minimum price from product variants
-      // NEW: Returns the least price among all enabled variants, or product.price if no variants
+      // NEW: Returns the least price among all enabled logical variants (grouped by specs without battery),
+      //       or product.price if no variants
       const getMinimumVariantPrice = (product) => {
-        if (product.variants && product.variants.length > 0) {
-          // Filter enabled variants and get their prices
-          const enabledVariants = product.variants.filter(v => v.enabled !== false);
-          if (enabledVariants.length > 0) {
-            const prices = enabledVariants.map(v => v.price).filter(price => price !== undefined && price !== null);
-            if (prices.length > 0) {
-              return Math.min(...prices);
-            }
+        if (!product.variants || product.variants.length === 0) {
+          return product.price || 0;
+        }
+
+        // Consider only enabled variants with a numeric price
+        const enabledVariants = product.variants.filter(
+          v => v.enabled !== false && v.price !== undefined && v.price !== null
+        );
+        if (enabledVariants.length === 0) return product.price || 0;
+
+        // Group variants by specs without battery-related keys.
+        // IMPORTANT: For each logical spec combination we ONLY use the FIRST encountered variant's price,
+        // mirroring the Dashboard UI where only the first variant in each group is shown for editing.
+        const groups = new Map();
+
+        const normalizeSpecsWithoutBattery = (specs) => {
+          const raw = specs instanceof Map ? Object.fromEntries(specs) : (specs || {});
+          const cleaned = {};
+          Object.entries(raw).forEach(([key, value]) => {
+            const k = String(key || '').toLowerCase();
+            if (k === 'battery condition' || k === 'battery') return;
+            cleaned[key] = value;
+          });
+          return JSON.stringify(cleaned);
+        };
+
+        for (const v of enabledVariants) {
+          const key = normalizeSpecsWithoutBattery(v.specs);
+          const priceNum = Number(v.price);
+          if (!Number.isFinite(priceNum)) continue;
+          
+          // If this logical combo is already recorded, skip it so we DON'T pull prices
+          // from hidden/duplicate variants that the Dashboard doesn't show.
+          if (!groups.has(key)) {
+            groups.set(key, priceNum);
           }
         }
-        // Fallback to product.price if no variants or no valid variant prices
-        return product.price || 0;
+
+        if (groups.size === 0) return product.price || 0;
+        return Math.min(...groups.values());
       };
 
       // For search, we'll do comprehensive filtering after fetching
@@ -216,20 +245,19 @@
         console.log(`After price filtering (by variant min price): ${products.length} products match`);
       }
       
-      // NEW: Update product price from first variant if variants exist
+      // NEW: Update product price from logical minimum variant price (grouped by specs without battery)
       // NEW: Keep product.images as common images (don't overwrite with variant images)
       const productsWithVariantData = products.map(product => {
         if (product.variants && product.variants.length > 0) {
+          // Set price to minimum logical variant price
+          product.price = getMinimumVariantPrice(product);
+
+          // Preserve existing common images; only fall back to first enabled variant images if none
           const firstEnabledVariant = product.variants.find(v => v.enabled !== false) || product.variants[0];
-          if (firstEnabledVariant) {
-            if (firstEnabledVariant.price !== undefined) {
-              product.price = firstEnabledVariant.price;
-            }
-            // NEW: Only use first variant's images if product has no common images
-            if ((!product.images || product.images.length === 0) && 
-                firstEnabledVariant.images && firstEnabledVariant.images.length > 0) {
-              product.images = firstEnabledVariant.images;
-            }
+          if (firstEnabledVariant &&
+              (!product.images || product.images.length === 0) &&
+              firstEnabledVariant.images && firstEnabledVariant.images.length > 0) {
+            product.images = firstEnabledVariant.images;
           }
         }
         return product;
