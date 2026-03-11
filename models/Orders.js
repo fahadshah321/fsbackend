@@ -10,6 +10,7 @@ const orderSchema = new mongoose.Schema({
     
     // Address Information
     address: String,
+    city: String,
     country: String,
     postalCode: String,
     

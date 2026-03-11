@@ -747,7 +747,7 @@ const sendOrderConfirmationEmail = async (order, customer) => {
         <div style="background: #f0f9ff; padding: 15px; border-radius: 8px; margin: 15px 0;">
           <h4 style="color: #0284c7; margin-top: 0;">Delivery Address</h4>
           <p>${order.guestInfo.address}</p>
-          <p>${order.guestInfo.postalCode || ''} ${order.guestInfo.country || ''}</p>
+          <p>${order.guestInfo.city || ''}${order.guestInfo.city && (order.guestInfo.postalCode || order.guestInfo.country) ? ', ' : ''}${order.guestInfo.postalCode || ''} ${order.guestInfo.country || ''}</p>
         </div>
       `;
     }
