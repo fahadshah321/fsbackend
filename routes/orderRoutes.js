@@ -612,17 +612,38 @@ router.post("/stripe", async (req, res) => {
     }
     const cancelUrl = `${cancelUrlBase}/api/orders/stripe-cancel?session_id={CHECKOUT_SESSION_ID}`;
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card", "klarna"],
+    // NEW: Klarna & PayPal REQUIRE customer_email and billing_address_collection
+    // Without these, Stripe silently hides those payment methods from the checkout page
+    const sessionConfig = {
+      payment_method_types: ["card", "klarna", "paypal"],
       mode: "payment",
       line_items: lineItems,
       success_url: `${process.env.FRONTEND_URL.replace(/\/$/, "")}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
+      // NEW: Required for Klarna & PayPal to appear
+      billing_address_collection: "required",
+      // NEW: Pass customer email so Klarna/PayPal know who the customer is
+      ...(guestInfo?.email && { customer_email: guestInfo.email }),
+      // NEW: Collect phone number (improves Klarna approval rates)
+      phone_number_collection: { enabled: true },
+      // NEW: Collect shipping address for delivery orders (Klarna needs country info)
+      ...(deliveryMethod === "delivery" && {
+        shipping_address_collection: {
+          allowed_countries: [
+            "DE", "AT", "BE", "CH", "NL", "FR", "IT", "ES", "PT", "GB",
+            "IE", "SE", "NO", "DK", "FI", "PL", "CZ", "HU", "RO", "BG",
+            "HR", "SK", "SI", "LT", "LV", "EE", "LU", "MT", "CY", "GR",
+            "US", "CA", "AU", "NZ", "JP", "SG"
+          ],
+        },
+      }),
       metadata: {
         orderId: order._id.toString()
       },
       client_reference_id: order._id.toString()
-    });
+    };
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
 
     order.stripeSessionId = session.id;
     await order.save();
