@@ -10,7 +10,7 @@ const orderSchema = new mongoose.Schema({
     
     // Address Information
     address: String,
-    city: String,
+    city: { type: String, required: true }, // NEW: make city compulsory in customer info
     country: String,
     postalCode: String,
     

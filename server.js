@@ -16,6 +16,7 @@ const orderRoutes = require("./routes/orderRoutes.js");
 const uploadRoutes = require("./routes/uploadRoutes");
 const categoryRoutes = require("./routes/category");
 const outletRoutes = require("./routes/outletRoutes.js");
+const promoCodeRoutes = require("./routes/promoCodeRoutes.js");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -103,6 +104,7 @@ app.use("/api/categories", categoryRoutes);
 app.use("/api/outlets", outletRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/orders", orderRoutes);
+app.use("/api/promocodes", promoCodeRoutes);
 
 // Global error handler
 app.use((err, req, res, next) => {

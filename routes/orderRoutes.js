@@ -5,6 +5,7 @@ const axios = require("axios");
 const PDFDocument = require("pdfkit");
 const Order = require("../models/Orders");
 const Product = require("../models/Product");
+const PromoCode = require("../models/PromoCode"); // NEW: promo codes for discounts
 const Cart = require("../models/Cart");
 const User = require("../models/User");
 
@@ -498,13 +499,27 @@ router.get("/stripe-cancel", async (req, res) => {
 // Stripe checkout for home delivery
 router.post("/stripe", async (req, res) => {
   try {
-    const { items = [], guestInfo = null, deliveryMethod = "delivery", outletId = null } = req.body;
+    const { items = [], guestInfo = null, deliveryMethod = "delivery", outletId = null, promo = null } = req.body;
     const userId = getUserIdFromToken(req);
     if (!items || !items.length) return res.status(400).json({ message: "No items provided" });
 
     console.log("Stripe checkout request:", { items, guestInfo, userId, deliveryMethod, outletId });
 
-    const total = items.reduce((s, it) => s + (it.price || 0) * (it.quantity || 1), 0);
+    // Optional: load promo code and determine eligible categories
+    let promoDoc = null;
+    if (promo?.code) {
+      try {
+        promoDoc = await PromoCode.findOne({
+          code: String(promo.code).trim().toUpperCase(),
+          isActive: true,
+        });
+        if (!promoDoc) {
+          console.warn("Promo code from checkout not found or inactive:", promo.code);
+        }
+      } catch (promoErr) {
+        console.error("Error loading promo code in stripe route:", promoErr);
+      }
+    }
 
     // NEW: Fetch product names for items missing names
     const itemsWithNames = await Promise.all(items.map(async (item) => {
@@ -529,17 +544,44 @@ router.post("/stripe", async (req, res) => {
       return item;
     }));
 
+    // Apply promo discount per eligible item (by category)
+    const hasPromo =
+      promoDoc &&
+      Array.isArray(promoDoc.categories) &&
+      promoDoc.categories.length > 0 &&
+      typeof promoDoc.discountPercent === "number" &&
+      promoDoc.discountPercent > 0;
+
+    let discountedItems = itemsWithNames;
+    if (hasPromo) {
+      const categorySet = new Set(promoDoc.categories);
+      const discountFactor = 1 - promoDoc.discountPercent / 100;
+      discountedItems = itemsWithNames.map((item) => {
+        const category = item.category;
+        let effectivePrice = item.price || 0;
+        if (category && categorySet.has(category)) {
+          effectivePrice = Number((effectivePrice * discountFactor).toFixed(2));
+        }
+        return { ...item, price: effectivePrice };
+      });
+    }
+
+    const total = discountedItems.reduce(
+      (s, it) => s + (it.price || 0) * (it.quantity || 1),
+      0
+    );
+
     const order = await createOrderDocument({ 
       userId, 
       guestInfo, 
-      items: itemsWithNames, 
+      items: discountedItems, 
       total, 
       paymentMethod: "Stripe",
       deliveryMethod,
       outletId
     });
 
-    const lineItems = itemsWithNames.map((item) => {
+    const lineItems = discountedItems.map((item) => {
       return {
         price_data: {
           currency: "eur", // Changed to EUR for Germany
@@ -596,10 +638,10 @@ router.post("/stripe", async (req, res) => {
 // Pickup order endpoint
 router.post("/pickup", async (req, res) => {
   try {
-    const { items = [], total = 0, guestInfo = null, outletId = null } = req.body;
+    const { items = [], total = 0, guestInfo = null, outletId = null, promo = null } = req.body;
     const userId = getUserIdFromToken(req);
 
-    console.log("Pickup order request:", { items, total, guestInfo, userId, outletId });
+    console.log("Pickup order request:", { items, total, guestInfo, userId, outletId, promo });
 
     if (!items || !items.length) return res.status(400).json({ message: "No items provided" });
 
@@ -607,11 +649,49 @@ router.post("/pickup", async (req, res) => {
       return res.status(400).json({ message: "Outlet selection is required for pickup orders" });
     }
 
+    // Optional: apply promo to pickup orders as well (same logic as Stripe)
+    let promoDoc = null;
+    if (promo?.code) {
+      try {
+        promoDoc = await PromoCode.findOne({
+          code: String(promo.code).trim().toUpperCase(),
+          isActive: true,
+        });
+      } catch (promoErr) {
+        console.error("Error loading promo code in pickup route:", promoErr);
+      }
+    }
+
+    let discountedItems = items;
+    let effectiveTotal = total;
+    const hasPromo =
+      promoDoc &&
+      Array.isArray(promoDoc.categories) &&
+      promoDoc.categories.length > 0 &&
+      typeof promoDoc.discountPercent === "number" &&
+      promoDoc.discountPercent > 0;
+
+    if (hasPromo) {
+      const categorySet = new Set(promoDoc.categories);
+      const discountFactor = 1 - promoDoc.discountPercent / 100;
+      discountedItems = items.map((item) => {
+        let effectivePrice = item.price || 0;
+        if (item.category && categorySet.has(item.category)) {
+          effectivePrice = Number((effectivePrice * discountFactor).toFixed(2));
+        }
+        return { ...item, price: effectivePrice };
+      });
+      effectiveTotal = discountedItems.reduce(
+        (s, it) => s + (it.price || 0) * (it.quantity || 1),
+        0
+      );
+    }
+
     const order = await createOrderDocument({ 
       userId, 
       guestInfo, 
-      items, 
-      total, 
+      items: discountedItems, 
+      total: effectiveTotal, 
       paymentMethod: "Pickup",
       deliveryMethod: "pickup",
       outletId
