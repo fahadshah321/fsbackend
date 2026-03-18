@@ -549,7 +549,7 @@ exports.resendVerification = async (req, res, next) => {
       </div>
     `;
 
-    await sendEmail(email, "Verify Your Email - F&S Smartphones", emailHtml);
+    await sendEmail(email, "Verify Your Email - F&s Smartphones", emailHtml);
 
     res.json({ message: "Verification email sent! Please check your inbox." });
   } catch (err) {

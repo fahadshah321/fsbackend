@@ -77,7 +77,7 @@ app.use(express.urlencoded({ extended: true }));
 // Basic route
 app.get("/", (req, res) =>
   res.json({
-    message: "F&S Smartphones API running",
+    message: "F&s Smartphones API running",
     timestamp: new Date().toISOString(),
   })
 );

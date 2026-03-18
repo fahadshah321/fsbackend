@@ -1062,7 +1062,7 @@ const sendStatusUpdateEmail = async (to, order, customerName, status, trackingNu
 
         <!-- Footer Bar -->
         <div style="background: #f9fafb; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e5e7eb;">
-          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&S Smartphones. All rights reserved.</p>
+          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&s Smartphones. All rights reserved.</p>
         </div>
       </div>
     `;
@@ -1281,7 +1281,7 @@ const sendOrderCancellationEmail = async (to, order, customerName, reason) => {
 
         <!-- Footer Bar -->
         <div style="background: #f9fafb; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e5e7eb;">
-          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&S Smartphones. All rights reserved.</p>
+          <p style="color: #6b7280; font-size: 12px; margin: 0;">© ${new Date().getFullYear()} F&s Smartphones. All rights reserved.</p>
         </div>
       </div>
     `;
