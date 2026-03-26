@@ -43,6 +43,29 @@ const productSchema = new mongoose.Schema({
   categoryRef: { type: mongoose.Schema.Types.ObjectId, ref: 'Category' },
   basePrice: { type: Number },
   specs: { type: Map, of: String },
+  // NEW: Keep bilingual product text so EN + DE are both preserved
+  translations: {
+    name: {
+      en: { type: String },
+      de: { type: String },
+    },
+    description: {
+      en: { type: String },
+      de: { type: String },
+    },
+    category: {
+      en: { type: String },
+      de: { type: String },
+    },
+    specs: {
+      en: { type: Map, of: String },
+      de: { type: Map, of: String },
+    },
+    variantSpecs: {
+      en: [{ type: Map, of: String }],
+      de: [{ type: Map, of: String }],
+    },
+  },
   variants: [variantSchema],
 });
 

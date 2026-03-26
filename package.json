@@ -4,13 +4,15 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "translate:de": "node scripts/translateProductsToGerman.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@vitalets/google-translate-api": "^9.2.1",
     "axios": "^1.13.1",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
@@ -21,6 +23,7 @@
     "express": "^5.1.0",
     "express-validator": "^7.3.0",
     "jsonwebtoken": "^9.0.2",
+    "mongodb": "^7.1.1",
     "mongoose": "^8.19.2",
     "multer": "^2.0.2",
     "nodemailer": "^7.0.10",

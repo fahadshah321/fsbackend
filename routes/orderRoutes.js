@@ -294,16 +294,46 @@ async function cancelOrder(order, reason = 'user_cancelled') {
 async function createOrderDocument({ userId, guestInfo, items, total, paymentMethod, deliveryMethod, outletId }) {
   console.log("Creating order document with items:", items);
   const products = await Product.find({ _id: { $in: items.map(i => i.productId) } });
+  const productById = new Map(products.map((p) => [p._id.toString(), p]));
+
+  const normalizeSpecsObject = (specs) => {
+    if (!specs) return undefined;
+    if (specs instanceof Map) return Object.fromEntries(specs);
+    if (typeof specs === "object") return specs;
+    return undefined;
+  };
+
   const order = new Order({
     userId: userId || undefined, // Set userId if logged in (for order tracking/profile)
     guestInfo: guestInfo || undefined, // Always use form data for shipping/delivery details, even if logged in
-    items: items.map(item => ({
+    items: items.map(item => {
+      const product = productById.get(String(item.productId));
+      const matchedVariant = product?.variants?.find(
+        (v) => item.variantId && v._id?.toString() === item.variantId?.toString()
+      );
+
+      const variantSpecsSnapshot =
+        normalizeSpecsObject(item.variantSpecs) ||
+        normalizeSpecsObject(matchedVariant?.specs) ||
+        undefined;
+
+      const productImageSnapshot =
+        item.image ||
+        matchedVariant?.images?.[0] ||
+        product?.images?.[0] ||
+        undefined;
+
+      return {
       productId: item.productId,
-      sellerId: products.find(p => p._id.equals(item.productId))?.sellerId,
+        sellerId: product?.sellerId,
       variantId: item.variantId,
+        productName: item.name || product?.name,
+        productImage: productImageSnapshot,
+        variantSpecs: variantSpecsSnapshot,
       quantity: item.quantity,
       price: item.price,
-    })),
+      };
+    }),
     total,
     paymentMethod: paymentMethod || "Stripe",
     deliveryMethod: deliveryMethod || "delivery",

@@ -23,6 +23,10 @@ const orderSchema = new mongoose.Schema({
       productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
       sellerId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
       variantId: { type: mongoose.Schema.Types.ObjectId },
+      // NEW: Persist product/variant snapshot fields so historical orders remain stable
+      productName: { type: String },
+      productImage: { type: String },
+      variantSpecs: { type: Map, of: String },
       quantity: { type: Number, required: true },
       price: { type: Number, required: true },
     },
